@@ -10,6 +10,36 @@ Generate complete lesson plan packages for CTE (Career and Technical Education) 
 - **Daily Presentations**: PowerPoint slides with auto-sourced images from Pexels and embedded YouTube videos
 - **Media Log**: Attribution tracking for all sourced media
 - **Auto-inference**: Automatically detects materials, methods, assessments, and curriculum integration from lesson content
+- **Interactive Mode**: When used via Claude Code skill, prompts for preferences before generating
+
+## Interactive Mode (Claude Code Skill)
+
+When invoked via the `/cte-lesson` skill in Claude Code, the generator asks 4 configuration questions before starting:
+
+| Question | Options | Default |
+|----------|---------|---------|
+| **Days of the Week** | Mon-Fri (5 days), Mon-Thu (4 days), Custom | Mon-Fri |
+| **Presentations** | Yes (with images/videos), No (faster) | No |
+| **Student Handouts** | Yes (Canva-quality), No | No |
+| **Vocabulary Summary** | Yes (end-of-week cards), No | No |
+
+### Quick Generation (Defaults)
+
+Using all defaults gives you the fastest generation:
+- 5 days of CTE lesson plans
+- Weekly teacher handout
+- No presentations, handouts, or vocabulary summary
+
+### Full Generation
+
+Selecting all "Yes" options produces:
+- 5 days of CTE lesson plans
+- Weekly teacher handout
+- Daily PowerPoint presentations with auto-sourced images
+- Student handouts for each lesson
+- End-of-week vocabulary summary cards
+
+**Note:** Presentations require the Pexels API and take longer to generate due to image sourcing.
 
 ## Output Documents
 
