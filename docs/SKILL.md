@@ -75,9 +75,9 @@ Before starting, use the AskUserQuestion tool to ask the user these configuratio
 - Question: "Create student handouts?"
 - Header: "Handouts"
 - Options:
-  - "No" - Skip student handouts (Recommended)
-  - "Yes" - Create Canva-quality student handouts
-- Default: No
+  - "Yes" - Create Canva-quality student handouts (Recommended)
+  - "No" - Skip student handouts
+- Default: Yes
 
 **Question 4: Vocabulary Summary**
 - Question: "Include end-of-week vocabulary summary?"

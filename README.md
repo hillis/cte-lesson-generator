@@ -20,15 +20,16 @@ When invoked via the `/cte-lesson` skill in Claude Code, the generator asks 4 co
 |----------|---------|---------|
 | **Days of the Week** | Mon-Fri (5 days), Mon-Thu (4 days), Custom | Mon-Fri |
 | **Presentations** | Yes (with images/videos), No (faster) | No |
-| **Student Handouts** | Yes (Canva-quality), No | No |
+| **Student Handouts** | Yes (Canva-quality), No | Yes |
 | **Vocabulary Summary** | Yes (end-of-week cards), No | No |
 
 ### Quick Generation (Defaults)
 
-Using all defaults gives you the fastest generation:
+Using all defaults gives you:
 - 5 days of CTE lesson plans
 - Weekly teacher handout
-- No presentations, handouts, or vocabulary summary
+- Student handouts
+- No presentations or vocabulary summary
 
 ### Full Generation
 
