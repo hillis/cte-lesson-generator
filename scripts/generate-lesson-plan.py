@@ -16,21 +16,123 @@ Usage: python generate-lesson-plan.py '<json_data>'
 import sys
 import json
 import os
-import requests
-import tempfile
 import re
+import requests
 from io import BytesIO
+from urllib.parse import urlparse
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from datetime import datetime
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
 
 # PowerPoint imports for presentations
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt as PptxPt
 from pptx.dml.color import RGBColor as PptxRGBColor
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.text import PP_ALIGN
 from pptx.enum.shapes import MSO_SHAPE
+
+# ============================================================================
+# SECURITY AND UTILITY HELPERS
+# ============================================================================
+
+def sanitize_filename(name, max_length=25):
+    """Sanitize a string for safe use in filenames.
+
+    Removes path traversal sequences, null bytes, and OS-unsafe characters.
+    """
+    if not isinstance(name, str):
+        name = str(name)
+    # Remove null bytes
+    name = name.replace('\x00', '')
+    # Remove path traversal sequences
+    name = name.replace('..', '')
+    # Replace path separators and other unsafe characters
+    name = re.sub(r'[\/\\:*?"<>|]', '-', name)
+    # Replace spaces with underscores
+    name = name.replace(' ', '_')
+    # Remove any remaining non-printable characters
+    name = re.sub(r'[^\w\-.]', '', name)
+    # Truncate
+    return name[:max_length] if max_length else name
+
+
+def validate_week_num(week_num):
+    """Validate and normalize week number to prevent path injection."""
+    week_str = str(week_num).strip()
+    # Strip to digits only
+    week_str = re.sub(r'[^0-9]', '', week_str)
+    if not week_str:
+        week_str = '1'
+    return week_str
+
+
+def validate_url(url):
+    """Validate that a URL uses HTTPS and points to an expected domain."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('https', 'http'):
+            return False
+        if not parsed.netloc:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def extract_lesson_text(day_data):
+    """Extract and combine all text content from a day's lesson data for analysis.
+
+    Centralizes the repeated pattern of gathering topic + overview + objectives +
+    schedule text that appears across all infer_* functions.
+    """
+    topic = day_data.get('topic', '').lower()
+    overview = day_data.get('overview', '').lower()
+    objectives = ' '.join(day_data.get('objectives', [])).lower()
+    day_materials = ' '.join(day_data.get('day_materials', [])).lower()
+    schedule_text = ''
+    activity_names = []
+    for activity in day_data.get('schedule', []):
+        if isinstance(activity, dict):
+            name = activity.get('name', '').lower()
+            desc = activity.get('description', '').lower()
+            activity_names.append(name)
+            schedule_text += ' ' + name + ' ' + desc
+    schedule_text = schedule_text.lower()
+    all_text = f"{topic} {overview} {objectives} {day_materials} {schedule_text}"
+    return all_text, activity_names
+
+
+def apply_cell_shading(cell, hex_color):
+    """Apply background shading to a Word document table cell.
+
+    Replaces the repeated parse_xml('<w:shd ...') pattern.
+    """
+    shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{hex_color}" w:val="clear"/>')
+    cell._tc.get_or_add_tcPr().append(shading)
+
+
+# ============================================================================
+# DOCUMENT COLOR CONSTANTS (shared across all generators)
+# ============================================================================
+
+# Word document colors
+DOC_NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)
+DOC_DARK_GRAY = RGBColor(0x33, 0x33, 0x33)
+DOC_MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)
+DOC_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+
+# Hex colors for cell shading
+HEX_LIGHT_BLUE = "D6E3F8"
+HEX_LIGHT_GRAY = "F5F5F5"
+HEX_LIGHT_GRAY_ALT = "F8F9FA"
+HEX_ACCENT_BLUE = "4A90D9"
+HEX_CREAM_YELLOW = "FFF9E6"
+HEX_SOFT_GREEN = "E8F5E9"
+HEX_NAVY = "1A3C6E"
+HEX_YELLOW_TAB = "FFD93D"
+
 
 # ============================================================================
 # API KEYS AND CONFIGURATION
@@ -99,6 +201,9 @@ def search_pexels_image(query, per_page=1):
 
 def download_image(url):
     """Download an image from URL and return as BytesIO object."""
+    if not validate_url(url):
+        print(f"Image download skipped: invalid URL", file=sys.stderr)
+        return None
     try:
         response = requests.get(url, timeout=15)
         if response.status_code == 200:
@@ -192,8 +297,6 @@ def search_youtube_video(topic, preferred_channels=None):
 
     # Fallback: Try web search
     try:
-        import warnings
-        warnings.filterwarnings('ignore')
         from duckduckgo_search import DDGS
 
         search_queries = [
@@ -314,9 +417,13 @@ OTHER_AREAS_CHECKBOXES = {
 
 def get_week_folder(week_num):
     """Get the week folder path, creating it if needed."""
-    # Ensure week number is zero-padded for proper sorting
-    week_str = str(week_num).zfill(2)
+    week_str = validate_week_num(week_num).zfill(2)
     week_folder = os.path.join(OUTPUT_DIR, f"Week{week_str}")
+    # Verify the resolved path is still under OUTPUT_DIR
+    real_output = os.path.realpath(OUTPUT_DIR)
+    real_week = os.path.realpath(week_folder)
+    if not real_week.startswith(real_output):
+        raise ValueError(f"Invalid week folder path: {week_folder}")
     os.makedirs(week_folder, exist_ok=True)
     return week_folder
 
@@ -352,7 +459,6 @@ def remove_red_text(doc):
 
 def mark_checkboxes_in_cell(cell, checkbox_map, selected_items):
     """Mark checkboxes in a cell by replacing underscores with checkmarks."""
-    import re
     for para in cell.paragraphs:
         for run in para.runs:
             text = run.text
@@ -447,16 +553,7 @@ def infer_other_areas(day_data, curriculum_areas):
     """Infer other areas addressed based on lesson content."""
     other_areas = list(day_data.get('other_areas', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            schedule_text += ' ' + activity.get('name', '') + ' ' + activity.get('description', '')
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    all_text, _ = extract_lesson_text(day_data)
 
     # Safety - equipment handling, safety procedures
     if any(word in all_text for word in ['safety', 'equipment', 'handling', 'protective', 'hazard', 'proper use', 'safely', 'precaution']):
@@ -516,11 +613,7 @@ def infer_curriculum_areas(day_data):
     """Infer integrated curriculum areas based on lesson content."""
     curriculum = list(day_data.get('curriculum', []))
 
-    # Keywords that suggest curriculum integration
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    all_text = f"{topic} {overview} {objectives}"
+    all_text, _ = extract_lesson_text(day_data)
 
     # Technology - almost always applies for media production
     if any(word in all_text for word in ['camera', 'editing', 'software', 'premiere', 'photoshop', 'computer', 'digital', 'video', 'audio', 'equipment']):
@@ -561,17 +654,7 @@ def infer_materials(day_data):
     """Infer materials and equipment based on lesson content."""
     materials = list(day_data.get('materials', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    day_materials = ' '.join(day_data.get('day_materials', [])).lower()
-    schedule_text = ''
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            schedule_text += ' ' + activity.get('name', '') + ' ' + activity.get('description', '')
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {day_materials} {schedule_text}"
+    all_text, _ = extract_lesson_text(day_data)
 
     # Projector - presentations, showing videos, demonstrations
     if any(word in all_text for word in ['presentation', 'present', 'show', 'display', 'screen', 'projector', 'slides', 'powerpoint']):
@@ -625,20 +708,7 @@ def infer_methods(day_data):
     """Infer instructional methods based on lesson content."""
     methods = list(day_data.get('methods', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    activity_names = []
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            name = activity.get('name', '').lower()
-            desc = activity.get('description', '').lower()
-            activity_names.append(name)
-            schedule_text += ' ' + name + ' ' + desc
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    all_text, activity_names = extract_lesson_text(day_data)
 
     # Discussion - class discussion, group discussion, Q&A
     if any(word in all_text for word in ['discussion', 'discuss', 'debate', 'share', 'q&a', 'conversation', 'talk about']):
@@ -678,20 +748,7 @@ def infer_assessment(day_data):
     """Infer assessment strategies based on lesson content."""
     assessment = list(day_data.get('assessment', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    activity_names = []
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            name = activity.get('name', '').lower()
-            desc = activity.get('description', '').lower()
-            activity_names.append(name)
-            schedule_text += ' ' + name + ' ' + desc
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    all_text, activity_names = extract_lesson_text(day_data)
 
     # Classwork - in-class activities, practice
     if any(word in all_text for word in ['classwork', 'class work', 'activity', 'practice', 'exercise', 'in-class', 'work on']):
@@ -816,7 +873,7 @@ def generate_cte_lesson_plan(day_data, week_num, day_num):
 
     # Generate filename in week folder
     week_folder = get_week_folder(week_num)
-    topic_slug = day_data.get('topic', 'Lesson').replace(' ', '_').replace('/', '-')[:25]
+    topic_slug = sanitize_filename(day_data.get('topic', 'Lesson'))
     filename = f"Day{day_num}_{topic_slug}_CTE.docx"
     output_path = os.path.join(week_folder, filename)
 
@@ -826,22 +883,17 @@ def generate_cte_lesson_plan(day_data, week_num, day_num):
 
 def generate_teacher_handout(week_data):
     """Generate a professionally styled Canva-quality teacher handout."""
-    from docx.shared import Inches, Pt, Twips
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls, qn
-    from docx.enum.style import WD_STYLE_TYPE
-
     doc = Document()
 
-    # Define colors - Enhanced palette
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)  # Professional navy
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)  # Body text
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)  # Secondary text
-    LIGHT_BLUE = "D6E3F8"  # Light blue for backgrounds
-    LIGHT_GRAY = "F5F5F5"  # Alternating row color
-    ACCENT_BLUE = "4A90D9"  # Brighter accent blue
-    CREAM_YELLOW = "FFF9E6"  # Light yellow for notes
-    SOFT_GREEN = "E8F5E9"  # Soft green for tips
+    # Use shared color constants
+    NAVY_BLUE = DOC_NAVY_BLUE
+    DARK_GRAY = DOC_DARK_GRAY
+    MEDIUM_GRAY = DOC_MEDIUM_GRAY
+    LIGHT_BLUE = HEX_LIGHT_BLUE
+    LIGHT_GRAY = HEX_LIGHT_GRAY
+    ACCENT_BLUE = HEX_ACCENT_BLUE
+    CREAM_YELLOW = HEX_CREAM_YELLOW
+    SOFT_GREEN = HEX_SOFT_GREEN
 
     # Set default document font
     style = doc.styles['Normal']
@@ -868,8 +920,7 @@ def generate_teacher_handout(week_data):
 
     # Accent bar (thin top bar)
     accent_cell = header_table.rows[0].cells[0]
-    accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-    accent_cell._tc.get_or_add_tcPr().append(accent_shading)
+    apply_cell_shading(accent_cell, ACCENT_BLUE)
     accent_p = accent_cell.paragraphs[0]
     accent_p.paragraph_format.space_after = Pt(0)
     # Make row very short
@@ -880,8 +931,7 @@ def generate_teacher_handout(week_data):
 
     # Main header cell
     main_cell = header_table.rows[1].cells[0]
-    main_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-    main_cell._tc.get_or_add_tcPr().append(main_shading)
+    apply_cell_shading(main_cell, HEX_NAVY)
 
     # Week number badge
     p = main_cell.paragraphs[0]
@@ -925,8 +975,7 @@ def generate_teacher_handout(week_data):
         # Sidebar cell (accent bar)
         sidebar_cell = header_tbl.rows[0].cells[0]
         sidebar_cell.width = Inches(0.08)
-        sidebar_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        sidebar_cell._tc.get_or_add_tcPr().append(sidebar_shading)
+        apply_cell_shading(sidebar_cell, ACCENT_BLUE)
 
         # Content cell
         content_cell = header_tbl.rows[0].cells[1]
@@ -957,9 +1006,7 @@ def generate_teacher_handout(week_data):
         card_table.style = 'Table Grid'
         cell = card_table.rows[0].cells[0]
 
-        # Background color
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{bg_color}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
+        apply_cell_shading(cell, bg_color)
 
         # Add content
         p = cell.paragraphs[0]
@@ -980,8 +1027,7 @@ def generate_teacher_handout(week_data):
         tip_table.style = 'Table Grid'
         cell = tip_table.rows[0].cells[0]
 
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{box_color}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
+        apply_cell_shading(cell, box_color)
 
         p = cell.paragraphs[0]
         run = p.add_run(content)
@@ -998,9 +1044,7 @@ def generate_teacher_handout(week_data):
         # Style header row
         if table.rows:
             for cell in table.rows[0].cells:
-                # Set background color for header
-                shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{header_color}" w:val="clear"/>')
-                cell._tc.get_or_add_tcPr().append(shading)
+                apply_cell_shading(cell, header_color)
                 # Style header text
                 for para in cell.paragraphs:
                     for run in para.runs:
@@ -1017,8 +1061,7 @@ def generate_teacher_handout(week_data):
 
         # Style the overview box with light blue background
         cell = overview_table.rows[0].cells[0]
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
+        apply_cell_shading(cell, LIGHT_BLUE)
 
         # Focus line with emphasis
         if week_data.get('week_focus'):
@@ -1063,8 +1106,7 @@ def generate_teacher_handout(week_data):
             run.font.size = Pt(11)
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             # Navy circle background
-            num_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-            num_cell._tc.get_or_add_tcPr().append(num_shading)
+            apply_cell_shading(num_cell, "1A3C6E")
 
             # Objective text cell
             text_cell = row.cells[1]
@@ -1097,8 +1139,7 @@ def generate_teacher_handout(week_data):
                     run.font.size = Pt(11)
                     # Alternating row color
                     if (i // 2) % 2 == 1:
-                        mat_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                        cell._tc.get_or_add_tcPr().append(mat_shading)
+                        apply_cell_shading(cell, LIGHT_GRAY)
 
         doc.add_paragraph()
 
@@ -1124,8 +1165,7 @@ def generate_teacher_handout(week_data):
                 cell.width = Inches(2.2)
 
                 # Background color
-                shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color}" w:val="clear"/>')
-                cell._tc.get_or_add_tcPr().append(shading)
+                apply_cell_shading(cell, color)
 
                 # Label
                 p = cell.paragraphs[0]
@@ -1161,8 +1201,7 @@ def generate_teacher_handout(week_data):
         # Day number "tab"
         tab_cell = day_header_table.rows[0].cells[0]
         tab_cell.width = Inches(1.2)
-        tab_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        tab_cell._tc.get_or_add_tcPr().append(tab_shading)
+        apply_cell_shading(tab_cell, ACCENT_BLUE)
 
         p = tab_cell.paragraphs[0]
         run = p.add_run(f"DAY {i}")
@@ -1181,8 +1220,7 @@ def generate_teacher_handout(week_data):
         # Topic bar
         topic_cell = day_header_table.rows[0].cells[1]
         topic_cell.width = Inches(5.7)
-        topic_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-        topic_cell._tc.get_or_add_tcPr().append(topic_shading)
+        apply_cell_shading(topic_cell, "1A3C6E")
 
         p = topic_cell.paragraphs[0]
         run = p.add_run(day.get('topic', 'Untitled'))
@@ -1204,8 +1242,7 @@ def generate_teacher_handout(week_data):
             obj_box = doc.add_table(rows=1, cols=1)
             obj_box.style = 'Table Grid'
             obj_cell = obj_box.rows[0].cells[0]
-            obj_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-            obj_cell._tc.get_or_add_tcPr().append(obj_shading)
+            apply_cell_shading(obj_cell, LIGHT_BLUE)
 
             for idx, obj in enumerate(day['objectives']):
                 p = obj_cell.paragraphs[0] if idx == 0 else obj_cell.add_paragraph()
@@ -1245,8 +1282,7 @@ def generate_teacher_handout(week_data):
                     run.font.size = Pt(11)
                     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
                     # Navy header background
-                    h_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-                    header_cells[idx]._tc.get_or_add_tcPr().append(h_shading)
+                    apply_cell_shading(header_cells[idx], "1A3C6E")
 
                 # Set column widths
                 header_cells[0].width = Inches(0.9)
@@ -1267,8 +1303,7 @@ def generate_teacher_handout(week_data):
                         run.font.size = Pt(10)
                         run.font.color.rgb = NAVY_BLUE
                         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        time_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-                        cells[0]._tc.get_or_add_tcPr().append(time_shading)
+                        apply_cell_shading(cells[0], LIGHT_BLUE)
 
                         # Activity name - bold
                         p = cells[1].paragraphs[0]
@@ -1288,8 +1323,7 @@ def generate_teacher_handout(week_data):
                     # Alternating row colors for non-time cells
                     if row_idx % 2 == 1:
                         for cell in cells[1:]:  # Skip time column
-                            row_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                            cell._tc.get_or_add_tcPr().append(row_shading)
+                            apply_cell_shading(cell, LIGHT_GRAY)
 
             doc.add_paragraph()
 
@@ -1313,8 +1347,7 @@ def generate_teacher_handout(week_data):
 
                         # Card background
                         card_bg = LIGHT_BLUE if (i // 2) % 2 == 0 else LIGHT_GRAY
-                        v_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{card_bg}" w:val="clear"/>')
-                        cell._tc.get_or_add_tcPr().append(v_shading)
+                        apply_cell_shading(cell, card_bg)
 
                         # Term (bold, navy)
                         p = cell.paragraphs[0]
@@ -1356,8 +1389,7 @@ def generate_teacher_handout(week_data):
 
                     # Get color for level
                     bg_color = diff_colors.get(level, LIGHT_GRAY)
-                    d_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{bg_color}" w:val="clear"/>')
-                    cell._tc.get_or_add_tcPr().append(d_shading)
+                    apply_cell_shading(cell, bg_color)
 
                     # Level label
                     p = cell.paragraphs[0]
@@ -1391,14 +1423,12 @@ def generate_teacher_handout(week_data):
             # Left accent bar (like a post-it tab)
             tab_cell = note_table.rows[0].cells[0]
             tab_cell.width = Inches(0.15)
-            tab_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="FFD93D" w:val="clear"/>')  # Yellow tab
-            tab_cell._tc.get_or_add_tcPr().append(tab_shading)
+            apply_cell_shading(tab_cell, "FFD93D")  # Yellow tab
 
             # Note content
             note_cell = note_table.rows[0].cells[1]
             note_cell.width = Inches(6.65)
-            note_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{CREAM_YELLOW}" w:val="clear"/>')
-            note_cell._tc.get_or_add_tcPr().append(note_shading)
+            apply_cell_shading(note_cell, CREAM_YELLOW)
 
             p = note_cell.paragraphs[0]
             run = p.add_run(day['teacher_notes'])
@@ -1420,8 +1450,7 @@ def generate_teacher_handout(week_data):
             cat_table = doc.add_table(rows=1, cols=1)
             cat_table.style = 'Table Grid'
             cell = cat_table.rows[0].cells[0]
-            cat_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-            cell._tc.get_or_add_tcPr().append(cat_shading)
+            apply_cell_shading(cell, LIGHT_BLUE)
 
             p = cell.paragraphs[0]
             run = p.add_run(category)
@@ -1448,14 +1477,12 @@ def generate_teacher_handout(week_data):
         # Yellow accent bar
         accent_cell = notes_table.rows[0].cells[0]
         accent_cell.width = Inches(0.15)
-        accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="FFD93D" w:val="clear"/>')
-        accent_cell._tc.get_or_add_tcPr().append(accent_shading)
+        apply_cell_shading(accent_cell, "FFD93D")
 
         # Notes content
         notes_cell = notes_table.rows[0].cells[1]
         notes_cell.width = Inches(6.65)
-        notes_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{CREAM_YELLOW}" w:val="clear"/>')
-        notes_cell._tc.get_or_add_tcPr().append(notes_shading)
+        apply_cell_shading(notes_cell, CREAM_YELLOW)
 
         for idx, note in enumerate(week_data['teacher_notes']):
             p = notes_cell.paragraphs[0] if idx == 0 else notes_cell.add_paragraph()
@@ -1473,8 +1500,7 @@ def generate_teacher_handout(week_data):
         std_table = doc.add_table(rows=1, cols=1)
         std_table.style = 'Table Grid'
         cell = std_table.rows[0].cells[0]
-        std_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(std_shading)
+        apply_cell_shading(cell, LIGHT_GRAY)
 
         p = cell.paragraphs[0]
         run = p.add_run(week_data['standards_alignment'])
@@ -1484,8 +1510,8 @@ def generate_teacher_handout(week_data):
 
     # Save document in week folder
     week_folder = get_week_folder(week_num)
-    unit_slug = unit_name.replace(' ', '_').replace('/', '-')[:20] if unit_name else 'Lessons'
-    filename = f"Week{week_num}_{unit_slug}_TeacherHandout.docx"
+    unit_slug = sanitize_filename(unit_name, max_length=20) if unit_name else 'Lessons'
+    filename = f"Week{validate_week_num(week_num)}_{unit_slug}_TeacherHandout.docx"
     output_path = os.path.join(week_folder, filename)
 
     doc.save(output_path)
@@ -1494,21 +1520,17 @@ def generate_teacher_handout(week_data):
 
 def generate_student_handout(handout_data, week_num, handout_name):
     """Generate a Canva-quality student handout with enhanced visual design."""
-    from docx.shared import Inches, Pt
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls
-
     doc = Document()
 
-    # Define colors - Enhanced palette for student handouts
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)
-    LIGHT_BLUE = "D6E3F8"
-    LIGHT_GRAY = "F8F9FA"  # Slightly lighter for more white space feel
-    ACCENT_BLUE = "4A90D9"
-    CREAM_YELLOW = "FFF9E6"
-    SOFT_GREEN = "E8F5E9"
+    # Use shared color constants
+    NAVY_BLUE = DOC_NAVY_BLUE
+    DARK_GRAY = DOC_DARK_GRAY
+    MEDIUM_GRAY = DOC_MEDIUM_GRAY
+    LIGHT_BLUE = HEX_LIGHT_BLUE
+    LIGHT_GRAY = HEX_LIGHT_GRAY_ALT  # Slightly lighter for more white space feel
+    ACCENT_BLUE = HEX_ACCENT_BLUE
+    CREAM_YELLOW = HEX_CREAM_YELLOW
+    SOFT_GREEN = HEX_SOFT_GREEN
 
     # Set default document font with more spacing
     style = doc.styles['Normal']
@@ -1534,8 +1556,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
         # Sidebar accent bar
         sidebar_cell = header_tbl.rows[0].cells[0]
         sidebar_cell.width = Inches(0.08)
-        sidebar_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        sidebar_cell._tc.get_or_add_tcPr().append(sidebar_shading)
+        apply_cell_shading(sidebar_cell, ACCENT_BLUE)
 
         # Content cell
         content_cell = header_tbl.rows[0].cells[1]
@@ -1559,8 +1580,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
 
     # Accent bar (thin top bar)
     accent_cell = header_table.rows[0].cells[0]
-    accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-    accent_cell._tc.get_or_add_tcPr().append(accent_shading)
+    apply_cell_shading(accent_cell, ACCENT_BLUE)
     accent_p = accent_cell.paragraphs[0]
     accent_p.paragraph_format.space_after = Pt(0)
     tr = header_table.rows[0]._tr
@@ -1570,8 +1590,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
 
     # Main header cell
     main_cell = header_table.rows[1].cells[0]
-    main_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-    main_cell._tc.get_or_add_tcPr().append(main_shading)
+    apply_cell_shading(main_cell, "1A3C6E")
 
     # Title
     p = main_cell.paragraphs[0]
@@ -1603,8 +1622,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
         inst_table = doc.add_table(rows=1, cols=1)
         inst_table.style = 'Table Grid'
         cell = inst_table.rows[0].cells[0]
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
+        apply_cell_shading(cell, LIGHT_BLUE)
 
         p = cell.paragraphs[0]
         run = p.add_run(handout_data['instructions'])
@@ -1645,8 +1663,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
                     run.font.size = Pt(12)
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     # Navy background for circular effect
-                    badge_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-                    num_cell._tc.get_or_add_tcPr().append(badge_shading)
+                    apply_cell_shading(num_cell, "1A3C6E")
 
                     # Content cell with alternating subtle background
                     content_cell = row.cells[1]
@@ -1657,8 +1674,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
                     run.font.size = Pt(11)
 
                     if idx % 2 == 0:
-                        row_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                        content_cell._tc.get_or_add_tcPr().append(row_shading)
+                        apply_cell_shading(content_cell, LIGHT_GRAY)
             else:
                 for item in section['items']:
                     p = doc.add_paragraph()
@@ -1690,8 +1706,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
             # Question number badge
             num_cell = q_table.rows[0].cells[0]
             num_cell.width = Inches(0.5)
-            badge_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-            num_cell._tc.get_or_add_tcPr().append(badge_shading)
+            apply_cell_shading(num_cell, "1A3C6E")
 
             p = num_cell.paragraphs[0]
             run = p.add_run(str(i))
@@ -1706,8 +1721,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
 
             # Alternating background
             if i % 2 == 0:
-                q_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                q_cell._tc.get_or_add_tcPr().append(q_shading)
+                apply_cell_shading(q_cell, LIGHT_GRAY)
 
             # Question text
             p = q_cell.paragraphs[0]
@@ -1745,8 +1759,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
 
                     # Card background - alternating colors
                     card_bg = LIGHT_BLUE if (i // 2) % 2 == 0 else LIGHT_GRAY
-                    v_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{card_bg}" w:val="clear"/>')
-                    cell._tc.get_or_add_tcPr().append(v_shading)
+                    apply_cell_shading(cell, card_bg)
 
                     # Term (bold, navy)
                     p = cell.paragraphs[0]
@@ -1775,14 +1788,12 @@ def generate_student_handout(handout_data, week_num, handout_name):
         # Yellow accent bar (like a highlight strip)
         accent_cell = tips_table.rows[0].cells[0]
         accent_cell.width = Inches(0.12)
-        accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="FFD93D" w:val="clear"/>')
-        accent_cell._tc.get_or_add_tcPr().append(accent_shading)
+        apply_cell_shading(accent_cell, "FFD93D")
 
         # Content cell
         content_cell = tips_table.rows[0].cells[1]
         content_cell.width = Inches(6.38)
-        content_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{CREAM_YELLOW}" w:val="clear"/>')
-        content_cell._tc.get_or_add_tcPr().append(content_shading)
+        apply_cell_shading(content_cell, CREAM_YELLOW)
 
         tips = handout_data.get('tips') or handout_data.get('notes', [])
         if isinstance(tips, list):
@@ -1799,7 +1810,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
 
     # Save document in week folder
     week_folder = get_week_folder(week_num)
-    name_slug = handout_name.replace(' ', '_').replace('/', '-')[:25]
+    name_slug = sanitize_filename(handout_name)
     filename = f"{name_slug}_StudentHandout.docx"
     output_path = os.path.join(week_folder, filename)
 
@@ -2347,7 +2358,7 @@ def generate_daily_presentation(day_data, week_num, day_num, unit_name=''):
 
     # Save presentation
     week_folder = get_week_folder(week_num)
-    topic_slug = topic.replace(' ', '_').replace('/', '-')[:25]
+    topic_slug = sanitize_filename(topic)
     filename = f"Day{day_num}_{topic_slug}_Presentation.pptx"
     output_path = os.path.join(week_folder, filename)
 
@@ -2388,27 +2399,57 @@ def generate_week(data):
         results['student_handouts'].append(path)
 
     # Generate daily lesson presentations (unless skip_presentations is True)
-    all_media_log = []
+    all_media_log = {'images': [], 'videos': []}
     if not skip_presentations:
         for i, day in enumerate(days, 1):
             try:
                 pres_path, media_log = generate_daily_presentation(day, week_num, i, unit_name)
                 results['daily_presentations'].append(pres_path)
-                all_media_log.extend(media_log)
+                all_media_log['images'].extend(media_log.get('images', []))
+                all_media_log['videos'].extend(media_log.get('videos', []))
             except Exception as e:
                 print(f"Warning: Could not generate presentation for Day {i}: {e}", file=sys.stderr)
 
         # Write media log file
-        if all_media_log:
-            media_log_path = os.path.join(results['week_folder'], f"Week{week_num}_Media_Log.txt")
+        if all_media_log['images'] or all_media_log['videos']:
+            week_str = validate_week_num(week_num)
+            media_log_path = os.path.join(results['week_folder'], f"Week{week_str}_Media_Log.txt")
             with open(media_log_path, 'w') as f:
                 f.write(f"Media Log - Week {week_num}: {unit_name}\n")
                 f.write("=" * 60 + "\n\n")
-                for entry in all_media_log:
-                    f.write(f"{entry}\n")
+                if all_media_log['images']:
+                    f.write("IMAGES\n" + "-" * 40 + "\n")
+                    for entry in all_media_log['images']:
+                        f.write(f"  Query: {entry.get('query', 'N/A')}\n")
+                        f.write(f"  URL: {entry.get('url', 'N/A')}\n\n")
+                if all_media_log['videos']:
+                    f.write("VIDEOS\n" + "-" * 40 + "\n")
+                    for entry in all_media_log['videos']:
+                        f.write(f"  Title: {entry.get('title', 'N/A')}\n")
+                        f.write(f"  URL: {entry.get('url', 'N/A')}\n\n")
             results['media_log'] = media_log_path
 
     return results
+
+
+def validate_input_data(data):
+    """Validate required fields in the input JSON data."""
+    if not isinstance(data, dict):
+        raise ValueError("Input must be a JSON object")
+
+    if 'days' in data:
+        if not isinstance(data['days'], list):
+            raise ValueError("'days' must be an array")
+        if not data['days']:
+            raise ValueError("'days' array must not be empty")
+        for i, day in enumerate(data['days']):
+            if not isinstance(day, dict):
+                raise ValueError(f"Day {i+1} must be a JSON object")
+            if not day.get('topic'):
+                raise ValueError(f"Day {i+1} is missing required 'topic' field")
+    else:
+        if not data.get('topic'):
+            raise ValueError("Single lesson is missing required 'topic' field")
 
 
 if __name__ == '__main__':
@@ -2418,6 +2459,7 @@ if __name__ == '__main__':
 
     try:
         data = json.loads(sys.argv[1])
+        validate_input_data(data)
 
         # Check if this is a weekly generation or single lesson
         if 'days' in data:
