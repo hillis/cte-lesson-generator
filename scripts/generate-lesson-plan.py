@@ -74,6 +74,16 @@ UNIT_COLOR_THEMES = {
 # Default theme (navy)
 DEFAULT_COLOR_THEME = (PptxRGBColor(0x1a, 0x3c, 0x6e), PptxRGBColor(0xD6, 0xE3, 0xF8), PptxRGBColor(0x34, 0x98, 0xDB))
 
+# Shared document color palette (used across teacher/student handouts)
+DOC_NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)
+DOC_DARK_GRAY = RGBColor(0x33, 0x33, 0x33)
+DOC_MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)
+DOC_LIGHT_BLUE = "D6E3F8"
+DOC_LIGHT_GRAY = "F5F5F5"
+DOC_ACCENT_BLUE = "4A90D9"
+DOC_CREAM_YELLOW = "FFF9E6"
+DOC_SOFT_GREEN = "E8F5E9"
+
 
 # ============================================================================
 # PEXELS API FUNCTIONS
@@ -81,6 +91,8 @@ DEFAULT_COLOR_THEME = (PptxRGBColor(0x1a, 0x3c, 0x6e), PptxRGBColor(0xD6, 0xE3, 
 
 def search_pexels_image(query, per_page=1):
     """Search Pexels for an image matching the query. Returns image URL or None."""
+    if not PEXELS_API_KEY:
+        return None
     try:
         headers = {'Authorization': PEXELS_API_KEY}
         params = {'query': query, 'per_page': per_page, 'orientation': 'landscape'}
@@ -89,8 +101,15 @@ def search_pexels_image(query, per_page=1):
         if response.status_code == 200:
             data = response.json()
             if data.get('photos') and len(data['photos']) > 0:
-                # Return the large size image URL
                 return data['photos'][0]['src']['large']
+        elif response.status_code == 401:
+            print("Pexels API error: Invalid API key", file=sys.stderr)
+        return None
+    except requests.exceptions.Timeout:
+        print("Pexels API error: Request timed out", file=sys.stderr)
+        return None
+    except requests.exceptions.ConnectionError:
+        print("Pexels API error: Could not connect", file=sys.stderr)
         return None
     except Exception as e:
         print(f"Pexels API error: {e}", file=sys.stderr)
@@ -99,10 +118,21 @@ def search_pexels_image(query, per_page=1):
 
 def download_image(url):
     """Download an image from URL and return as BytesIO object."""
+    if not url or not url.startswith('https://'):
+        return None
     try:
         response = requests.get(url, timeout=15)
         if response.status_code == 200:
+            content_type = response.headers.get('Content-Type', '')
+            if not content_type.startswith('image/'):
+                return None
             return BytesIO(response.content)
+        return None
+    except requests.exceptions.Timeout:
+        print("Image download error: Request timed out", file=sys.stderr)
+        return None
+    except requests.exceptions.ConnectionError:
+        print("Image download error: Could not connect", file=sys.stderr)
         return None
     except Exception as e:
         print(f"Image download error: {e}", file=sys.stderr)
@@ -312,10 +342,130 @@ OTHER_AREAS_CHECKBOXES = {
 }
 
 
+def setup_document(doc, top=0.6, bottom=0.6, left=0.7, right=0.7, line_spacing=1.15, space_after=6):
+    """Configure default document styles and margins."""
+    style = doc.styles['Normal']
+    style.font.name = 'Calibri'
+    style.font.size = Pt(11)
+    style.font.color.rgb = DOC_DARK_GRAY
+    style.paragraph_format.space_after = Pt(space_after)
+    style.paragraph_format.line_spacing = line_spacing
+
+    for section in doc.sections:
+        section.top_margin = Inches(top)
+        section.bottom_margin = Inches(bottom)
+        section.left_margin = Inches(left)
+        section.right_margin = Inches(right)
+
+
+def add_doc_section_header(doc, text, level=1, accent_color=None):
+    """Add a section header with left accent bar to a document."""
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    color = accent_color or DOC_ACCENT_BLUE
+    header_tbl = doc.add_table(rows=1, cols=2)
+    header_tbl.autofit = False
+
+    sidebar_cell = header_tbl.rows[0].cells[0]
+    sidebar_cell.width = Inches(0.08)
+    sidebar_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color}" w:val="clear"/>')
+    sidebar_cell._tc.get_or_add_tcPr().append(sidebar_shading)
+
+    content_cell = header_tbl.rows[0].cells[1]
+    content_cell.width = Inches(6.8)
+
+    p = content_cell.paragraphs[0]
+    run = p.add_run(text)
+    run.bold = True
+    run.font.color.rgb = DOC_NAVY_BLUE
+    if level == 1:
+        run.font.size = Pt(16)
+        run.font.name = 'Cambria'
+        p.paragraph_format.space_before = Pt(4)
+        p.paragraph_format.space_after = Pt(4)
+    else:
+        run.font.size = Pt(13)
+        run.font.name = 'Cambria'
+        p.paragraph_format.space_before = Pt(2)
+        p.paragraph_format.space_after = Pt(2)
+
+    return p
+
+
+def add_doc_header_banner(doc, title_text, subtitle_text=None, badge_text=None):
+    """Add a styled header banner with accent bar to a document."""
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+
+    header_table = doc.add_table(rows=2, cols=1)
+    header_table.style = 'Table Grid'
+
+    # Accent bar
+    accent_cell = header_table.rows[0].cells[0]
+    accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{DOC_ACCENT_BLUE}" w:val="clear"/>')
+    accent_cell._tc.get_or_add_tcPr().append(accent_shading)
+    accent_p = accent_cell.paragraphs[0]
+    accent_p.paragraph_format.space_after = Pt(0)
+    tr = header_table.rows[0]._tr
+    trPr = tr.get_or_add_trPr()
+    trHeight = parse_xml(f'<w:trHeight {nsdecls("w")} w:val="100" w:hRule="exact"/>')
+    trPr.append(trHeight)
+
+    # Main header cell
+    main_cell = header_table.rows[1].cells[0]
+    main_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
+    main_cell._tc.get_or_add_tcPr().append(main_shading)
+
+    # Optional badge (e.g., "WEEK 5")
+    if badge_text:
+        p = main_cell.paragraphs[0]
+        run = p.add_run(badge_text)
+        run.bold = True
+        run.font.size = Pt(11)
+        run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
+        run.font.name = 'Calibri'
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(2)
+        # Title goes in next paragraph
+        p = main_cell.add_paragraph()
+    else:
+        p = main_cell.paragraphs[0]
+
+    # Title
+    run = p.add_run(title_text)
+    run.bold = True
+    run.font.size = Pt(24) if not badge_text else Pt(28)
+    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+    run.font.name = 'Cambria'
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(4 if badge_text else 8)
+    p.paragraph_format.space_after = Pt(4)
+
+    # Subtitle
+    if subtitle_text:
+        p = main_cell.add_paragraph()
+        run = p.add_run(subtitle_text)
+        run.font.size = Pt(11 if badge_text else 12)
+        run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
+        run.font.name = 'Calibri'
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(8)
+
+    return main_cell
+
+
+def sanitize_slug(text, max_length=25):
+    """Sanitize text for use in filenames, removing unsafe characters."""
+    slug = re.sub(r'[^\w\s-]', '', text)
+    slug = slug.replace(' ', '_')
+    slug = re.sub(r'[_.]+', lambda m: m.group(0)[0], slug)
+    return slug[:max_length].rstrip('_')
+
+
 def get_week_folder(week_num):
     """Get the week folder path, creating it if needed."""
-    # Ensure week number is zero-padded for proper sorting
-    week_str = str(week_num).zfill(2)
+    week_str = str(int(week_num)).zfill(2)
     week_folder = os.path.join(OUTPUT_DIR, f"Week{week_str}")
     os.makedirs(week_folder, exist_ok=True)
     return week_folder
@@ -443,71 +593,56 @@ def build_differentiation_text(day_data):
     return '\n'.join(lines)
 
 
+def get_lesson_text(day_data, include_materials=False):
+    """Extract all searchable text content from a day's lesson data."""
+    parts = [
+        day_data.get('topic', ''),
+        day_data.get('overview', ''),
+        ' '.join(day_data.get('objectives', [])),
+    ]
+    if include_materials:
+        parts.append(' '.join(day_data.get('day_materials', [])))
+    for activity in day_data.get('schedule', []):
+        if isinstance(activity, dict):
+            parts.append(activity.get('name', ''))
+            parts.append(activity.get('description', ''))
+    return ' '.join(parts).lower()
+
+
+def check_keywords(text, keywords):
+    """Check if any keyword is found in the given text."""
+    return any(kw in text for kw in keywords)
+
+
 def infer_other_areas(day_data, curriculum_areas):
     """Infer other areas addressed based on lesson content."""
     other_areas = list(day_data.get('other_areas', []))
+    all_text = get_lesson_text(day_data)
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            schedule_text += ' ' + activity.get('name', '') + ' ' + activity.get('description', '')
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    keyword_map = {
+        'safety': ['safety', 'equipment', 'handling', 'protective', 'hazard', 'proper use', 'safely', 'precaution'],
+        'management_skills': ['time management', 'organize', 'planning', 'schedule', 'project management', 'workflow', 'deadline'],
+        'teamwork': ['team', 'group', 'collaborat', 'partner', 'cooperative', 'crew', 'together'],
+        'live_work': ['client', 'real-world', 'live production', 'actual client', 'community partner'],
+        'higher_order_reasoning': ['analyze', 'evaluat', 'create', 'critiqu', 'compare', 'synthesize', 'design', 'develop', 'assess'],
+        'work_ethics': ['professional', 'responsibility', 'deadline', 'punctual', 'quality', 'ethic', 'industry standard'],
+        'ctso': ['skillsusa', 'ctso', 'competition', 'career development', 'leadership'],
+        'problem_solving': ['problem', 'solve', 'troubleshoot', 'debug', 'fix', 'challenge', 'solution', 'figure out'],
+    }
 
-    # Safety - equipment handling, safety procedures
-    if any(word in all_text for word in ['safety', 'equipment', 'handling', 'protective', 'hazard', 'proper use', 'safely', 'precaution']):
-        if 'safety' not in other_areas:
-            other_areas.append('safety')
+    for area, keywords in keyword_map.items():
+        if area not in other_areas and check_keywords(all_text, keywords):
+            other_areas.append(area)
 
-    # Management Skills - time management, organization, planning
-    if any(word in all_text for word in ['time management', 'organize', 'planning', 'schedule', 'project management', 'workflow', 'deadline']):
-        if 'management_skills' not in other_areas:
-            other_areas.append('management_skills')
-
-    # Teamwork - collaborative work
-    if any(word in all_text for word in ['team', 'group', 'collaborat', 'partner', 'cooperative', 'crew', 'together']):
-        if 'teamwork' not in other_areas:
-            other_areas.append('teamwork')
-
-    # Live Work - real client/real-world production (rare, usually explicit)
-    if any(word in all_text for word in ['client', 'real-world', 'live production', 'actual client', 'community partner']):
-        if 'live_work' not in other_areas:
-            other_areas.append('live_work')
-
-    # Higher Order Reasoning - analysis, evaluation, creation, critique
-    if any(word in all_text for word in ['analyze', 'evaluat', 'create', 'critiqu', 'compare', 'synthesize', 'design', 'develop', 'assess']):
-        if 'higher_order_reasoning' not in other_areas:
-            other_areas.append('higher_order_reasoning')
-
-    # Varied Learning - multiple modalities, different learning styles
-    if any(word in all_text for word in ['visual', 'hands-on', 'demonstration', 'practice', 'kinesthetic', 'auditory']) or \
-       (day_data.get('differentiation') and len(day_data.get('differentiation', {})) > 0):
-        if 'varied_learning' not in other_areas:
+    # Varied Learning - also checks differentiation data
+    if 'varied_learning' not in other_areas:
+        if check_keywords(all_text, ['visual', 'hands-on', 'demonstration', 'practice', 'kinesthetic', 'auditory']) or \
+           bool(day_data.get('differentiation')):
             other_areas.append('varied_learning')
 
-    # Work Ethics - professionalism, responsibility, deadlines
-    if any(word in all_text for word in ['professional', 'responsibility', 'deadline', 'punctual', 'quality', 'ethic', 'industry standard']):
-        if 'work_ethics' not in other_areas:
-            other_areas.append('work_ethics')
-
     # Integrated Academics - if curriculum areas are checked
-    if curriculum_areas and len(curriculum_areas) > 0:
-        if 'integrated_academics' not in other_areas:
-            other_areas.append('integrated_academics')
-
-    # CTSO - SkillsUSA, competitions, career development
-    if any(word in all_text for word in ['skillsusa', 'ctso', 'competition', 'career development', 'leadership']):
-        if 'ctso' not in other_areas:
-            other_areas.append('ctso')
-
-    # Problem Solving - troubleshooting, debugging, challenges
-    if any(word in all_text for word in ['problem', 'solve', 'troubleshoot', 'debug', 'fix', 'challenge', 'solution', 'figure out']):
-        if 'problem_solving' not in other_areas:
-            other_areas.append('problem_solving')
+    if curriculum_areas and 'integrated_academics' not in other_areas:
+        other_areas.append('integrated_academics')
 
     return other_areas
 
@@ -515,44 +650,24 @@ def infer_other_areas(day_data, curriculum_areas):
 def infer_curriculum_areas(day_data):
     """Infer integrated curriculum areas based on lesson content."""
     curriculum = list(day_data.get('curriculum', []))
+    all_text = get_lesson_text(day_data)
 
-    # Keywords that suggest curriculum integration
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    all_text = f"{topic} {overview} {objectives}"
+    keyword_map = {
+        'technology': ['camera', 'editing', 'software', 'premiere', 'photoshop', 'computer', 'digital', 'video', 'audio', 'equipment'],
+        'english': ['script', 'writing', 'story', 'narrative', 'reading', 'research', 'interview', 'article', 'news'],
+        'fine_arts': ['composition', 'visual', 'design', 'aesthetic', 'creative', 'artistic', 'color', 'lighting', 'framing'],
+        'math': ['exposure', 'ratio', 'frame rate', 'aperture', 'shutter speed', 'iso', 'calculation', 'percentage'],
+        'science': ['light', 'sound wave', 'physics', 'optics', 'frequency', 'wavelength'],
+        'social_studies': ['history', 'documentary', 'social', 'community', 'culture', 'news', 'current events', 'psa', 'public service'],
+    }
 
-    # Technology - almost always applies for media production
-    if any(word in all_text for word in ['camera', 'editing', 'software', 'premiere', 'photoshop', 'computer', 'digital', 'video', 'audio', 'equipment']):
-        if 'technology' not in curriculum:
-            curriculum.append('technology')
+    for area, keywords in keyword_map.items():
+        if area not in curriculum and check_keywords(all_text, keywords):
+            curriculum.append(area)
 
-    # English/Reading - scriptwriting, storytelling, research
-    if any(word in all_text for word in ['script', 'writing', 'story', 'narrative', 'reading', 'research', 'interview', 'article', 'news']):
-        if 'english' not in curriculum:
-            curriculum.append('english')
-        if 'reading' not in curriculum and any(word in all_text for word in ['reading', 'research', 'article']):
-            curriculum.append('reading')
-
-    # Fine Arts - composition, visual design, creativity
-    if any(word in all_text for word in ['composition', 'visual', 'design', 'aesthetic', 'creative', 'artistic', 'color', 'lighting', 'framing']):
-        if 'fine_arts' not in curriculum:
-            curriculum.append('fine_arts')
-
-    # Math - exposure triangle, ratios, frame rates
-    if any(word in all_text for word in ['exposure', 'ratio', 'frame rate', 'aperture', 'shutter speed', 'iso', 'calculation', 'percentage']):
-        if 'math' not in curriculum:
-            curriculum.append('math')
-
-    # Science - light, sound waves, physics of cameras
-    if any(word in all_text for word in ['light', 'sound wave', 'physics', 'optics', 'frequency', 'wavelength']):
-        if 'science' not in curriculum:
-            curriculum.append('science')
-
-    # Social Studies - documentary, history, PSA topics, news
-    if any(word in all_text for word in ['history', 'documentary', 'social', 'community', 'culture', 'news', 'current events', 'psa', 'public service']):
-        if 'social_studies' not in curriculum:
-            curriculum.append('social_studies')
+    # Reading is a sub-check of english
+    if 'reading' not in curriculum and check_keywords(all_text, ['reading', 'research', 'article']):
+        curriculum.append('reading')
 
     return curriculum
 
@@ -560,63 +675,23 @@ def infer_curriculum_areas(day_data):
 def infer_materials(day_data):
     """Infer materials and equipment based on lesson content."""
     materials = list(day_data.get('materials', []))
+    all_text = get_lesson_text(day_data, include_materials=True)
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    day_materials = ' '.join(day_data.get('day_materials', [])).lower()
-    schedule_text = ''
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            schedule_text += ' ' + activity.get('name', '') + ' ' + activity.get('description', '')
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {day_materials} {schedule_text}"
+    keyword_map = {
+        'projector': ['presentation', 'present', 'show', 'display', 'screen', 'projector', 'slides', 'powerpoint'],
+        'computer': ['computer', 'premiere', 'photoshop', 'editing', 'software', 'digital', 'laptop', 'workstation'],
+        'video_dvd': ['video', 'watch', 'film', 'movie', 'clip', 'example', 'youtube', 'dvd'],
+        'labs': ['lab', 'studio', 'hands-on', 'practice', 'filming', 'shoot', 'record'],
+        'speaker': ['audio', 'sound', 'music', 'listen', 'speaker', 'playback'],
+        'supplemental_materials': ['handout', 'worksheet', 'guide', 'reference', 'template', 'storyboard', 'script'],
+        'other_equipment': ['camera', 'tripod', 'lighting', 'light', 'microphone', 'mic', 'equipment', 'gear', 'sd card', 'memory card'],
+        'student_journals': ['journal', 'notebook', 'notes', 'reflection', 'write', 'record thoughts'],
+        'posters': ['poster', 'chart', 'diagram', 'visual aid', 'infographic'],
+    }
 
-    # Projector - presentations, showing videos, demonstrations
-    if any(word in all_text for word in ['presentation', 'present', 'show', 'display', 'screen', 'projector', 'slides', 'powerpoint']):
-        if 'projector' not in materials:
-            materials.append('projector')
-
-    # Computer - editing, software, digital work
-    if any(word in all_text for word in ['computer', 'premiere', 'photoshop', 'editing', 'software', 'digital', 'laptop', 'workstation']):
-        if 'computer' not in materials:
-            materials.append('computer')
-
-    # Video/DVD - watching examples, film clips, demonstrations
-    if any(word in all_text for word in ['video', 'watch', 'film', 'movie', 'clip', 'example', 'youtube', 'dvd']):
-        if 'video_dvd' not in materials:
-            materials.append('video_dvd')
-
-    # Labs - hands-on activities, practice, studio work
-    if any(word in all_text for word in ['lab', 'studio', 'hands-on', 'practice', 'filming', 'shoot', 'record']):
-        if 'labs' not in materials:
-            materials.append('labs')
-
-    # Speaker - audio playback
-    if any(word in all_text for word in ['audio', 'sound', 'music', 'listen', 'speaker', 'playback']):
-        if 'speaker' not in materials:
-            materials.append('speaker')
-
-    # Supplemental Materials - handouts, worksheets, guides
-    if any(word in all_text for word in ['handout', 'worksheet', 'guide', 'reference', 'template', 'storyboard', 'script']):
-        if 'supplemental_materials' not in materials:
-            materials.append('supplemental_materials')
-
-    # Other Equipment - cameras, tripods, lighting, microphones
-    if any(word in all_text for word in ['camera', 'tripod', 'lighting', 'light', 'microphone', 'mic', 'equipment', 'gear', 'sd card', 'memory card']):
-        if 'other_equipment' not in materials:
-            materials.append('other_equipment')
-
-    # Student Journals - reflection, note-taking
-    if any(word in all_text for word in ['journal', 'notebook', 'notes', 'reflection', 'write', 'record thoughts']):
-        if 'student_journals' not in materials:
-            materials.append('student_journals')
-
-    # Posters - visual aids, reference charts
-    if any(word in all_text for word in ['poster', 'chart', 'diagram', 'visual aid', 'infographic']):
-        if 'posters' not in materials:
-            materials.append('posters')
+    for material, keywords in keyword_map.items():
+        if material not in materials and check_keywords(all_text, keywords):
+            materials.append(material)
 
     return materials
 
@@ -624,52 +699,31 @@ def infer_materials(day_data):
 def infer_methods(day_data):
     """Infer instructional methods based on lesson content."""
     methods = list(day_data.get('methods', []))
+    all_text = get_lesson_text(day_data)
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
+    # Extract activity names for special lecture check
     activity_names = []
     for activity in day_data.get('schedule', []):
         if isinstance(activity, dict):
-            name = activity.get('name', '').lower()
-            desc = activity.get('description', '').lower()
-            activity_names.append(name)
-            schedule_text += ' ' + name + ' ' + desc
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+            activity_names.append(activity.get('name', '').lower())
 
-    # Discussion - class discussion, group discussion, Q&A
-    if any(word in all_text for word in ['discussion', 'discuss', 'debate', 'share', 'q&a', 'conversation', 'talk about']):
-        if 'discussion' not in methods:
-            methods.append('discussion')
+    keyword_map = {
+        'discussion': ['discussion', 'discuss', 'debate', 'share', 'q&a', 'conversation', 'talk about'],
+        'demonstration': ['demonstrat', 'show how', 'model', 'walk through', 'example', 'tutorial'],
+        'powerpoint': ['powerpoint', 'presentation', 'slides', 'slide deck', 'pptx'],
+        'multimedia': ['video', 'multimedia', 'multi-media', 'youtube', 'film', 'audio', 'digital'],
+        'guest_speaker': ['guest speaker', 'guest', 'industry professional', 'visitor', 'expert'],
+    }
 
-    # Demonstration - showing how to do something
-    if any(word in all_text for word in ['demonstrat', 'show how', 'model', 'walk through', 'example', 'tutorial']):
-        if 'demonstration' not in methods:
-            methods.append('demonstration')
+    for method, keywords in keyword_map.items():
+        if method not in methods and check_keywords(all_text, keywords):
+            methods.append(method)
 
-    # Lecture - direct instruction, teaching, explaining
-    if any(name in ['direct instruction', 'lecture', 'mini-lecture', 'instruction'] for name in activity_names) or \
-       any(word in all_text for word in ['lecture', 'direct instruction', 'teach', 'explain', 'present content', 'introduce']):
-        if 'lecture' not in methods:
+    # Lecture - also checks activity names directly
+    if 'lecture' not in methods:
+        if any(name in ['direct instruction', 'lecture', 'mini-lecture', 'instruction'] for name in activity_names) or \
+           check_keywords(all_text, ['lecture', 'direct instruction', 'teach', 'explain', 'present content', 'introduce']):
             methods.append('lecture')
-
-    # PowerPoint - presentations, slides
-    if any(word in all_text for word in ['powerpoint', 'presentation', 'slides', 'slide deck', 'pptx']):
-        if 'powerpoint' not in methods:
-            methods.append('powerpoint')
-
-    # Multi-Media - videos, audio, digital content
-    if any(word in all_text for word in ['video', 'multimedia', 'multi-media', 'youtube', 'film', 'audio', 'digital']):
-        if 'multimedia' not in methods:
-            methods.append('multimedia')
-
-    # Guest Speaker - industry professional, visitor
-    if any(word in all_text for word in ['guest speaker', 'guest', 'industry professional', 'visitor', 'expert']):
-        if 'guest_speaker' not in methods:
-            methods.append('guest_speaker')
 
     return methods
 
@@ -677,66 +731,26 @@ def infer_methods(day_data):
 def infer_assessment(day_data):
     """Infer assessment strategies based on lesson content."""
     assessment = list(day_data.get('assessment', []))
+    all_text = get_lesson_text(day_data)
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    activity_names = []
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            name = activity.get('name', '').lower()
-            desc = activity.get('description', '').lower()
-            activity_names.append(name)
-            schedule_text += ' ' + name + ' ' + desc
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    keyword_map = {
+        'classwork': ['classwork', 'class work', 'activity', 'practice', 'exercise', 'in-class', 'work on'],
+        'observation': ['observ', 'monitor', 'circulate', 'watch', 'check in', 'walk around'],
+        'project_based': ['project', 'final', 'deliverable', 'portfolio', 'create', 'produce', 'video project'],
+        'teamwork': ['team', 'group', 'partner', 'collaborat', 'crew', 'together', 'peer'],
+        'performance': ['perform', 'present', 'demonstrat', 'show', 'pitch', 'share out'],
+        'on_task': ['participat', 'engag', 'on-task', 'focused', 'active'],
+        'test': ['test', 'quiz', 'exam', 'assessment'],
+        'homework': ['homework', 'home work', 'take home', 'assignment', 'due next'],
+    }
 
-    # Classwork - in-class activities, practice
-    if any(word in all_text for word in ['classwork', 'class work', 'activity', 'practice', 'exercise', 'in-class', 'work on']):
-        if 'classwork' not in assessment:
-            assessment.append('classwork')
+    for strategy, keywords in keyword_map.items():
+        if strategy not in assessment and check_keywords(all_text, keywords):
+            assessment.append(strategy)
 
-    # Observation - teacher watching, monitoring
-    if any(word in all_text for word in ['observ', 'monitor', 'circulate', 'watch', 'check in', 'walk around']):
-        if 'observation' not in assessment:
-            assessment.append('observation')
-
-    # Project-based - projects, final products, deliverables
-    if any(word in all_text for word in ['project', 'final', 'deliverable', 'portfolio', 'create', 'produce', 'video project']):
-        if 'project_based' not in assessment:
-            assessment.append('project_based')
-
-    # Teamwork - group work, collaboration, partner work
-    if any(word in all_text for word in ['team', 'group', 'partner', 'collaborat', 'crew', 'together', 'peer']):
-        if 'teamwork' not in assessment:
-            assessment.append('teamwork')
-
-    # Performance - demonstrations, presentations by students
-    if any(word in all_text for word in ['perform', 'present', 'demonstrat', 'show', 'pitch', 'share out']):
-        if 'performance' not in assessment:
-            assessment.append('performance')
-
-    # On-Task - participation, engagement
-    if any(word in all_text for word in ['participat', 'engag', 'on-task', 'focused', 'active']):
-        if 'on_task' not in assessment:
-            assessment.append('on_task')
-
-    # Test - quiz, exam, test
-    if any(word in all_text for word in ['test', 'quiz', 'exam', 'assessment']):
-        if 'test' not in assessment:
-            assessment.append('test')
-
-    # Homework - take-home, assignment
-    if any(word in all_text for word in ['homework', 'home work', 'take home', 'assignment', 'due next']):
-        if 'homework' not in assessment:
-            assessment.append('homework')
-
-    # Exit ticket check
-    if any(word in all_text for word in ['exit ticket', 'exit slip', 'reflection']):
-        if 'classwork' not in assessment:
-            assessment.append('classwork')
+    # Exit ticket also counts as classwork
+    if 'classwork' not in assessment and check_keywords(all_text, ['exit ticket', 'exit slip', 'reflection']):
+        assessment.append('classwork')
 
     return assessment
 
@@ -816,7 +830,7 @@ def generate_cte_lesson_plan(day_data, week_num, day_num):
 
     # Generate filename in week folder
     week_folder = get_week_folder(week_num)
-    topic_slug = day_data.get('topic', 'Lesson').replace(' ', '_').replace('/', '-')[:25]
+    topic_slug = sanitize_slug(day_data.get('topic', 'Lesson'))
     filename = f"Day{day_num}_{topic_slug}_CTE.docx"
     output_path = os.path.join(week_folder, filename)
 
@@ -826,129 +840,35 @@ def generate_cte_lesson_plan(day_data, week_num, day_num):
 
 def generate_teacher_handout(week_data):
     """Generate a professionally styled Canva-quality teacher handout."""
-    from docx.shared import Inches, Pt, Twips
     from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls, qn
-    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml.ns import nsdecls
 
     doc = Document()
 
-    # Define colors - Enhanced palette
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)  # Professional navy
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)  # Body text
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)  # Secondary text
-    LIGHT_BLUE = "D6E3F8"  # Light blue for backgrounds
-    LIGHT_GRAY = "F5F5F5"  # Alternating row color
-    ACCENT_BLUE = "4A90D9"  # Brighter accent blue
-    CREAM_YELLOW = "FFF9E6"  # Light yellow for notes
-    SOFT_GREEN = "E8F5E9"  # Soft green for tips
+    # Use shared color palette
+    NAVY_BLUE = DOC_NAVY_BLUE
+    DARK_GRAY = DOC_DARK_GRAY
+    MEDIUM_GRAY = DOC_MEDIUM_GRAY
+    LIGHT_BLUE = DOC_LIGHT_BLUE
+    LIGHT_GRAY = DOC_LIGHT_GRAY
+    ACCENT_BLUE = DOC_ACCENT_BLUE
+    CREAM_YELLOW = DOC_CREAM_YELLOW
+    SOFT_GREEN = DOC_SOFT_GREEN
 
-    # Set default document font
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(11)
-    style.font.color.rgb = DARK_GRAY
-    style.paragraph_format.space_after = Pt(6)
-    style.paragraph_format.line_spacing = 1.15
-
-    # Set margins
-    sections = doc.sections
-    for section in sections:
-        section.top_margin = Inches(0.6)
-        section.bottom_margin = Inches(0.6)
-        section.left_margin = Inches(0.7)
-        section.right_margin = Inches(0.7)
+    setup_document(doc)
 
     week_num = week_data.get('week', '')
     unit_name = week_data.get('unit', '')
 
-    # === HEADER BANNER (Full-width with accent bar) ===
-    header_table = doc.add_table(rows=2, cols=1)
-    header_table.style = 'Table Grid'
-
-    # Accent bar (thin top bar)
-    accent_cell = header_table.rows[0].cells[0]
-    accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-    accent_cell._tc.get_or_add_tcPr().append(accent_shading)
-    accent_p = accent_cell.paragraphs[0]
-    accent_p.paragraph_format.space_after = Pt(0)
-    # Make row very short
-    tr = header_table.rows[0]._tr
-    trPr = tr.get_or_add_trPr()
-    trHeight = parse_xml(f'<w:trHeight {nsdecls("w")} w:val="100" w:hRule="exact"/>')
-    trPr.append(trHeight)
-
-    # Main header cell
-    main_cell = header_table.rows[1].cells[0]
-    main_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-    main_cell._tc.get_or_add_tcPr().append(main_shading)
-
-    # Week number badge
-    p = main_cell.paragraphs[0]
-    run = p.add_run(f"WEEK {week_num}")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
-    run.font.name = 'Calibri'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(2)
-
-    # Unit title
-    p = main_cell.add_paragraph()
-    run = p.add_run(unit_name)
-    run.bold = True
-    run.font.size = Pt(28)
-    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.name = 'Cambria'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(4)
-    p.paragraph_format.space_after = Pt(4)
-
-    # Subtitle
-    p = main_cell.add_paragraph()
-    run = p.add_run("Media Foundations · Teacher Guide")
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
-    run.font.name = 'Calibri'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(8)
+    # === HEADER BANNER ===
+    add_doc_header_banner(doc, unit_name,
+                          subtitle_text="Media Foundations · Teacher Guide",
+                          badge_text=f"WEEK {week_num}")
 
     doc.add_paragraph()
 
-    # === Helper function for styled section headers with icons and sidebar ===
     def add_section_header(text, level=1):
-        """Add a section header with left accent bar."""
-        # Create a table for sidebar effect
-        header_tbl = doc.add_table(rows=1, cols=2)
-        header_tbl.autofit = False
-
-        # Sidebar cell (accent bar)
-        sidebar_cell = header_tbl.rows[0].cells[0]
-        sidebar_cell.width = Inches(0.08)
-        sidebar_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        sidebar_cell._tc.get_or_add_tcPr().append(sidebar_shading)
-
-        # Content cell
-        content_cell = header_tbl.rows[0].cells[1]
-        content_cell.width = Inches(6.8)
-
-        p = content_cell.paragraphs[0]
-
-        run = p.add_run(text)
-        run.bold = True
-        run.font.color.rgb = NAVY_BLUE
-        if level == 1:
-            run.font.size = Pt(16)
-            run.font.name = 'Cambria'
-            p.paragraph_format.space_before = Pt(4)
-            p.paragraph_format.space_after = Pt(4)
-        else:
-            run.font.size = Pt(13)
-            run.font.name = 'Cambria'
-            p.paragraph_format.space_before = Pt(2)
-            p.paragraph_format.space_after = Pt(2)
-
-        return p
+        return add_doc_section_header(doc, text, level=level)
 
     # === Helper function for card-style boxes ===
     def add_card_box(content, bg_color=LIGHT_BLUE, border_color="1A3C6E"):
@@ -1484,7 +1404,7 @@ def generate_teacher_handout(week_data):
 
     # Save document in week folder
     week_folder = get_week_folder(week_num)
-    unit_slug = unit_name.replace(' ', '_').replace('/', '-')[:20] if unit_name else 'Lessons'
+    unit_slug = sanitize_slug(unit_name, max_length=20) if unit_name else 'Lessons'
     filename = f"Week{week_num}_{unit_slug}_TeacherHandout.docx"
     output_path = os.path.join(week_folder, filename)
 
@@ -1494,105 +1414,30 @@ def generate_teacher_handout(week_data):
 
 def generate_student_handout(handout_data, week_num, handout_name):
     """Generate a Canva-quality student handout with enhanced visual design."""
-    from docx.shared import Inches, Pt
     from docx.oxml import parse_xml
     from docx.oxml.ns import nsdecls
 
     doc = Document()
 
-    # Define colors - Enhanced palette for student handouts
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)
-    LIGHT_BLUE = "D6E3F8"
-    LIGHT_GRAY = "F8F9FA"  # Slightly lighter for more white space feel
-    ACCENT_BLUE = "4A90D9"
-    CREAM_YELLOW = "FFF9E6"
-    SOFT_GREEN = "E8F5E9"
+    # Use shared color palette
+    NAVY_BLUE = DOC_NAVY_BLUE
+    DARK_GRAY = DOC_DARK_GRAY
+    MEDIUM_GRAY = DOC_MEDIUM_GRAY
+    LIGHT_BLUE = DOC_LIGHT_BLUE
+    LIGHT_GRAY = "F8F9FA"  # Slightly lighter for student handouts
+    ACCENT_BLUE = DOC_ACCENT_BLUE
+    CREAM_YELLOW = DOC_CREAM_YELLOW
+    SOFT_GREEN = DOC_SOFT_GREEN
 
-    # Set default document font with more spacing
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(11)
-    style.font.color.rgb = DARK_GRAY
-    style.paragraph_format.space_after = Pt(8)  # More space
-    style.paragraph_format.line_spacing = 1.25  # More breathing room
+    setup_document(doc, top=0.7, bottom=0.7, left=0.8, right=0.8,
+                   line_spacing=1.25, space_after=8)
 
-    # Set margins - slightly more generous for cleaner look
-    for section in doc.sections:
-        section.top_margin = Inches(0.7)
-        section.bottom_margin = Inches(0.7)
-        section.left_margin = Inches(0.8)
-        section.right_margin = Inches(0.8)
-
-    # === Helper function for section headers with sidebar accent ===
     def add_section_header(text):
-        """Add a section header with left accent bar."""
-        header_tbl = doc.add_table(rows=1, cols=2)
-        header_tbl.autofit = False
+        return add_doc_section_header(doc, text, level=1)
 
-        # Sidebar accent bar
-        sidebar_cell = header_tbl.rows[0].cells[0]
-        sidebar_cell.width = Inches(0.08)
-        sidebar_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        sidebar_cell._tc.get_or_add_tcPr().append(sidebar_shading)
-
-        # Content cell
-        content_cell = header_tbl.rows[0].cells[1]
-        content_cell.width = Inches(6.4)
-
-        p = content_cell.paragraphs[0]
-
-        run = p.add_run(text)
-        run.bold = True
-        run.font.size = Pt(15)
-        run.font.color.rgb = NAVY_BLUE
-        run.font.name = 'Cambria'
-        p.paragraph_format.space_before = Pt(4)
-        p.paragraph_format.space_after = Pt(4)
-
-        return p
-
-    # === HEADER BANNER (Enhanced with accent bar) ===
-    header_table = doc.add_table(rows=2, cols=1)
-    header_table.style = 'Table Grid'
-
-    # Accent bar (thin top bar)
-    accent_cell = header_table.rows[0].cells[0]
-    accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-    accent_cell._tc.get_or_add_tcPr().append(accent_shading)
-    accent_p = accent_cell.paragraphs[0]
-    accent_p.paragraph_format.space_after = Pt(0)
-    tr = header_table.rows[0]._tr
-    trPr = tr.get_or_add_trPr()
-    trHeight = parse_xml(f'<w:trHeight {nsdecls("w")} w:val="100" w:hRule="exact"/>')
-    trPr.append(trHeight)
-
-    # Main header cell
-    main_cell = header_table.rows[1].cells[0]
-    main_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-    main_cell._tc.get_or_add_tcPr().append(main_shading)
-
-    # Title
-    p = main_cell.paragraphs[0]
-    run = p.add_run(handout_data.get('title', 'Student Handout'))
-    run.bold = True
-    run.font.size = Pt(24)
-    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.name = 'Cambria'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(8)
-    p.paragraph_format.space_after = Pt(4)
-
-    # Subtitle if provided
-    if handout_data.get('subtitle'):
-        p = main_cell.add_paragraph()
-        run = p.add_run(handout_data['subtitle'])
-        run.font.size = Pt(12)
-        run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
-        run.font.name = 'Calibri'
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(8)
+    # === HEADER BANNER ===
+    add_doc_header_banner(doc, handout_data.get('title', 'Student Handout'),
+                          subtitle_text=handout_data.get('subtitle'))
 
     doc.add_paragraph()  # Extra spacing
 
@@ -1799,7 +1644,7 @@ def generate_student_handout(handout_data, week_num, handout_name):
 
     # Save document in week folder
     week_folder = get_week_folder(week_num)
-    name_slug = handout_name.replace(' ', '_').replace('/', '-')[:25]
+    name_slug = sanitize_slug(handout_name)
     filename = f"{name_slug}_StudentHandout.docx"
     output_path = os.path.join(week_folder, filename)
 
@@ -2347,7 +2192,7 @@ def generate_daily_presentation(day_data, week_num, day_num, unit_name=''):
 
     # Save presentation
     week_folder = get_week_folder(week_num)
-    topic_slug = topic.replace(' ', '_').replace('/', '-')[:25]
+    topic_slug = sanitize_slug(topic)
     filename = f"Day{day_num}_{topic_slug}_Presentation.pptx"
     output_path = os.path.join(week_folder, filename)
 
@@ -2411,6 +2256,42 @@ def generate_week(data):
     return results
 
 
+def validate_lesson_data(data):
+    """Validate the structure of lesson plan JSON data."""
+    if not isinstance(data, dict):
+        raise ValueError("Input must be a JSON object")
+
+    if 'days' in data:
+        if not isinstance(data['days'], list) or not data['days']:
+            raise ValueError("'days' must be a non-empty array")
+        for i, day in enumerate(data['days'], 1):
+            if not isinstance(day, dict):
+                raise ValueError(f"Day {i} must be a JSON object")
+            if not day.get('topic'):
+                raise ValueError(f"Day {i} is missing required 'topic' field")
+    else:
+        if not data.get('topic'):
+            raise ValueError("Single lesson is missing required 'topic' field")
+
+
+def print_results(results):
+    """Print generation results summary."""
+    print("SUCCESS: Weekly lesson plans generated")
+    print(f"Week Folder: {results['week_folder']}")
+    print(f"CTE Plans: {len(results['cte_plans'])}")
+    for path in results['cte_plans']:
+        print(f"  - {os.path.basename(path)}")
+    print(f"Teacher Handout: {os.path.basename(results['teacher_handout'])}")
+    for path in results['student_handouts']:
+        print(f"Student Handout: {os.path.basename(path)}")
+    if results['daily_presentations']:
+        print(f"Daily Presentations: {len(results['daily_presentations'])}")
+        for path in results['daily_presentations']:
+            print(f"  - {os.path.basename(path)}")
+    if results.get('media_log'):
+        print(f"Media Log: {os.path.basename(results['media_log'])}")
+
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: python generate-lesson-plan.py '<json_data>'", file=sys.stderr)
@@ -2418,32 +2299,24 @@ if __name__ == '__main__':
 
     try:
         data = json.loads(sys.argv[1])
+        validate_lesson_data(data)
 
-        # Check if this is a weekly generation or single lesson
         if 'days' in data:
             results = generate_week(data)
-            print("SUCCESS: Weekly lesson plans generated")
-            print(f"Week Folder: {results['week_folder']}")
-            print(f"CTE Plans: {len(results['cte_plans'])}")
-            for path in results['cte_plans']:
-                print(f"  - {os.path.basename(path)}")
-            print(f"Teacher Handout: {os.path.basename(results['teacher_handout'])}")
-            for path in results['student_handouts']:
-                print(f"Student Handout: {os.path.basename(path)}")
-            if results['daily_presentations']:
-                print(f"Daily Presentations: {len(results['daily_presentations'])}")
-                for path in results['daily_presentations']:
-                    print(f"  - {os.path.basename(path)}")
-            if results.get('media_log'):
-                print(f"Media Log: {os.path.basename(results['media_log'])}")
+            print_results(results)
         else:
-            # Single CTE lesson plan (backwards compatibility)
             week = data.get('week', '1')
             output_path = generate_cte_lesson_plan(data, week, 1)
             print(f"SUCCESS: {output_path}")
 
     except json.JSONDecodeError as e:
         print(f"ERROR: Invalid JSON - {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"ERROR: Invalid input - {e}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"ERROR: File not found - {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         import traceback
