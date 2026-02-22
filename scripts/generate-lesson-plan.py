@@ -17,12 +17,15 @@ import sys
 import json
 import os
 import requests
-import tempfile
 import re
 from io import BytesIO
+from urllib.parse import urlparse
 from docx import Document
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Inches, Pt, Twips, RGBColor
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls, qn
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
 from datetime import datetime
 
 # PowerPoint imports for presentations
@@ -31,6 +34,13 @@ from pptx.util import Inches as PptxInches, Pt as PptxPt
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.enum.shapes import MSO_SHAPE
+
+# Maximum size for downloaded images (10 MB)
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+# Allowed schemes for image URLs
+ALLOWED_URL_SCHEMES = {'http', 'https'}
+# Maximum length for filename slug components
+MAX_SLUG_LENGTH = 25
 
 # ============================================================================
 # API KEYS AND CONFIGURATION
@@ -74,6 +84,128 @@ UNIT_COLOR_THEMES = {
 # Default theme (navy)
 DEFAULT_COLOR_THEME = (PptxRGBColor(0x1a, 0x3c, 0x6e), PptxRGBColor(0xD6, 0xE3, 0xF8), PptxRGBColor(0x34, 0x98, 0xDB))
 
+# ============================================================================
+# SHARED DOCUMENT STYLE CONSTANTS
+# ============================================================================
+
+# Shared color palette used by teacher handouts, student handouts, etc.
+DOC_COLORS = {
+    'navy_blue': RGBColor(0x1a, 0x3c, 0x6e),
+    'dark_gray': RGBColor(0x33, 0x33, 0x33),
+    'medium_gray': RGBColor(0x66, 0x66, 0x66),
+    'white': RGBColor(0xFF, 0xFF, 0xFF),
+    'light_blue_hex': "D6E3F8",
+    'light_gray_hex': "F5F5F5",
+    'accent_blue_hex': "4A90D9",
+    'cream_yellow_hex': "FFF9E6",
+    'soft_green_hex': "E8F5E9",
+    'navy_hex': "1A3C6E",
+}
+
+# ============================================================================
+# SECURITY / VALIDATION HELPERS
+# ============================================================================
+
+def sanitize_filename(name, max_length=MAX_SLUG_LENGTH):
+    """Sanitize a string for use in a filename.
+
+    Strips path separators, null bytes, and other unsafe characters,
+    then truncates to max_length.
+    """
+    # Remove null bytes and path separators
+    name = name.replace('\x00', '').replace('/', '-').replace('\\', '-')
+    # Collapse whitespace to underscores
+    name = re.sub(r'\s+', '_', name)
+    # Strip any remaining characters that are not alphanumeric, dash, or underscore
+    name = re.sub(r'[^\w\-]', '', name)
+    return name[:max_length]
+
+
+def validate_url(url):
+    """Validate that a URL uses an allowed scheme and has a valid host.
+
+    Returns True if the URL is safe to fetch, False otherwise.
+    Blocks private/internal network ranges to prevent SSRF.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in ALLOWED_URL_SCHEMES:
+        return False
+
+    host = parsed.hostname
+    if not host:
+        return False
+
+    # Block obviously internal hostnames
+    internal_patterns = ('localhost', '127.', '10.', '192.168.', '169.254.', '0.0.0.0', '[::1]')
+    if any(host.startswith(p) or host == p.rstrip('.') for p in internal_patterns):
+        return False
+
+    return True
+
+
+def safe_resolve_path(base_dir, filename):
+    """Resolve a file path and ensure it stays within base_dir.
+
+    Raises ValueError if the resolved path escapes the base directory.
+    """
+    base = os.path.realpath(base_dir)
+    target = os.path.realpath(os.path.join(base_dir, filename))
+    if not target.startswith(base + os.sep) and target != base:
+        raise ValueError(f"Path traversal detected: {filename!r} resolves outside {base_dir!r}")
+    return target
+
+
+def gather_lesson_text(day_data, include_schedule=True, include_materials=False):
+    """Gather text from multiple lesson data fields for keyword analysis.
+
+    This consolidates the repeated pattern of extracting and joining text
+    from topic, overview, objectives, schedule, and materials.
+
+    Returns a single lowercase string for keyword matching.
+    """
+    parts = [
+        day_data.get('topic', ''),
+        day_data.get('overview', ''),
+        ' '.join(day_data.get('objectives', [])),
+    ]
+
+    if include_materials:
+        parts.append(' '.join(day_data.get('day_materials', [])))
+
+    if include_schedule:
+        for activity in day_data.get('schedule', []):
+            if isinstance(activity, dict):
+                parts.append(activity.get('name', ''))
+                parts.append(activity.get('description', ''))
+
+    return ' '.join(parts).lower()
+
+
+def validate_json_data(data):
+    """Validate the top-level structure of the input JSON data.
+
+    Raises ValueError with a descriptive message for invalid input.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Input must be a JSON object")
+
+    if 'days' in data:
+        if not isinstance(data['days'], list):
+            raise ValueError("'days' must be a list")
+        if len(data['days']) > 7:
+            raise ValueError("'days' cannot contain more than 7 entries")
+        for i, day in enumerate(data['days']):
+            if not isinstance(day, dict):
+                raise ValueError(f"days[{i}] must be a JSON object")
+
+    if 'student_handouts' in data:
+        if not isinstance(data['student_handouts'], list):
+            raise ValueError("'student_handouts' must be a list")
+
 
 # ============================================================================
 # PEXELS API FUNCTIONS
@@ -98,12 +230,33 @@ def search_pexels_image(query, per_page=1):
 
 
 def download_image(url):
-    """Download an image from URL and return as BytesIO object."""
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            return BytesIO(response.content)
+    """Download an image from URL and return as BytesIO object.
+
+    Validates the URL before fetching and enforces a size limit to prevent
+    memory exhaustion from unexpectedly large responses.
+    """
+    if not validate_url(url):
+        print(f"Image download blocked: invalid or internal URL: {url}", file=sys.stderr)
         return None
+    try:
+        response = requests.get(url, timeout=15, stream=True)
+        if response.status_code != 200:
+            return None
+        # Check Content-Length header when available
+        content_length = response.headers.get('Content-Length')
+        if content_length and int(content_length) > MAX_IMAGE_BYTES:
+            print(f"Image too large ({content_length} bytes): {url}", file=sys.stderr)
+            return None
+        # Read in chunks and enforce size limit
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            total += len(chunk)
+            if total > MAX_IMAGE_BYTES:
+                print(f"Image exceeded {MAX_IMAGE_BYTES} byte limit: {url}", file=sys.stderr)
+                return None
+            chunks.append(chunk)
+        return BytesIO(b''.join(chunks))
     except Exception as e:
         print(f"Image download error: {e}", file=sys.stderr)
         return None
@@ -313,10 +466,14 @@ OTHER_AREAS_CHECKBOXES = {
 
 
 def get_week_folder(week_num):
-    """Get the week folder path, creating it if needed."""
-    # Ensure week number is zero-padded for proper sorting
-    week_str = str(week_num).zfill(2)
-    week_folder = os.path.join(OUTPUT_DIR, f"Week{week_str}")
+    """Get the week folder path, creating it if needed.
+
+    Validates that the resulting path stays within OUTPUT_DIR.
+    """
+    # Sanitize week_num to digits only
+    week_str = re.sub(r'[^0-9]', '', str(week_num)).zfill(2)
+    folder_name = f"Week{week_str}"
+    week_folder = safe_resolve_path(OUTPUT_DIR, folder_name)
     os.makedirs(week_folder, exist_ok=True)
     return week_folder
 
@@ -352,7 +509,6 @@ def remove_red_text(doc):
 
 def mark_checkboxes_in_cell(cell, checkbox_map, selected_items):
     """Mark checkboxes in a cell by replacing underscores with checkmarks."""
-    import re
     for para in cell.paragraphs:
         for run in para.runs:
             text = run.text
@@ -447,16 +603,7 @@ def infer_other_areas(day_data, curriculum_areas):
     """Infer other areas addressed based on lesson content."""
     other_areas = list(day_data.get('other_areas', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            schedule_text += ' ' + activity.get('name', '') + ' ' + activity.get('description', '')
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    all_text = gather_lesson_text(day_data)
 
     # Safety - equipment handling, safety procedures
     if any(word in all_text for word in ['safety', 'equipment', 'handling', 'protective', 'hazard', 'proper use', 'safely', 'precaution']):
@@ -516,11 +663,7 @@ def infer_curriculum_areas(day_data):
     """Infer integrated curriculum areas based on lesson content."""
     curriculum = list(day_data.get('curriculum', []))
 
-    # Keywords that suggest curriculum integration
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    all_text = f"{topic} {overview} {objectives}"
+    all_text = gather_lesson_text(day_data, include_schedule=False)
 
     # Technology - almost always applies for media production
     if any(word in all_text for word in ['camera', 'editing', 'software', 'premiere', 'photoshop', 'computer', 'digital', 'video', 'audio', 'equipment']):
@@ -561,17 +704,7 @@ def infer_materials(day_data):
     """Infer materials and equipment based on lesson content."""
     materials = list(day_data.get('materials', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    day_materials = ' '.join(day_data.get('day_materials', [])).lower()
-    schedule_text = ''
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            schedule_text += ' ' + activity.get('name', '') + ' ' + activity.get('description', '')
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {day_materials} {schedule_text}"
+    all_text = gather_lesson_text(day_data, include_materials=True)
 
     # Projector - presentations, showing videos, demonstrations
     if any(word in all_text for word in ['presentation', 'present', 'show', 'display', 'screen', 'projector', 'slides', 'powerpoint']):
@@ -625,20 +758,12 @@ def infer_methods(day_data):
     """Infer instructional methods based on lesson content."""
     methods = list(day_data.get('methods', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    activity_names = []
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            name = activity.get('name', '').lower()
-            desc = activity.get('description', '').lower()
-            activity_names.append(name)
-            schedule_text += ' ' + name + ' ' + desc
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    all_text = gather_lesson_text(day_data)
+    activity_names = [
+        activity.get('name', '').lower()
+        for activity in day_data.get('schedule', [])
+        if isinstance(activity, dict)
+    ]
 
     # Discussion - class discussion, group discussion, Q&A
     if any(word in all_text for word in ['discussion', 'discuss', 'debate', 'share', 'q&a', 'conversation', 'talk about']):
@@ -678,20 +803,7 @@ def infer_assessment(day_data):
     """Infer assessment strategies based on lesson content."""
     assessment = list(day_data.get('assessment', []))
 
-    # Get all text content to analyze
-    topic = day_data.get('topic', '').lower()
-    overview = day_data.get('overview', '').lower()
-    objectives = ' '.join(day_data.get('objectives', [])).lower()
-    schedule_text = ''
-    activity_names = []
-    for activity in day_data.get('schedule', []):
-        if isinstance(activity, dict):
-            name = activity.get('name', '').lower()
-            desc = activity.get('description', '').lower()
-            activity_names.append(name)
-            schedule_text += ' ' + name + ' ' + desc
-    schedule_text = schedule_text.lower()
-    all_text = f"{topic} {overview} {objectives} {schedule_text}"
+    all_text = gather_lesson_text(day_data)
 
     # Classwork - in-class activities, practice
     if any(word in all_text for word in ['classwork', 'class work', 'activity', 'practice', 'exercise', 'in-class', 'work on']):
@@ -816,9 +928,9 @@ def generate_cte_lesson_plan(day_data, week_num, day_num):
 
     # Generate filename in week folder
     week_folder = get_week_folder(week_num)
-    topic_slug = day_data.get('topic', 'Lesson').replace(' ', '_').replace('/', '-')[:25]
-    filename = f"Day{day_num}_{topic_slug}_CTE.docx"
-    output_path = os.path.join(week_folder, filename)
+    topic_slug = sanitize_filename(day_data.get('topic', 'Lesson'))
+    filename = f"Day{int(day_num)}_{topic_slug}_CTE.docx"
+    output_path = safe_resolve_path(week_folder, filename)
 
     doc.save(output_path)
     return output_path
@@ -826,22 +938,17 @@ def generate_cte_lesson_plan(day_data, week_num, day_num):
 
 def generate_teacher_handout(week_data):
     """Generate a professionally styled Canva-quality teacher handout."""
-    from docx.shared import Inches, Pt, Twips
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls, qn
-    from docx.enum.style import WD_STYLE_TYPE
-
     doc = Document()
 
-    # Define colors - Enhanced palette
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)  # Professional navy
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)  # Body text
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)  # Secondary text
-    LIGHT_BLUE = "D6E3F8"  # Light blue for backgrounds
-    LIGHT_GRAY = "F5F5F5"  # Alternating row color
-    ACCENT_BLUE = "4A90D9"  # Brighter accent blue
-    CREAM_YELLOW = "FFF9E6"  # Light yellow for notes
-    SOFT_GREEN = "E8F5E9"  # Soft green for tips
+    # Use shared color palette
+    NAVY_BLUE = DOC_COLORS['navy_blue']
+    DARK_GRAY = DOC_COLORS['dark_gray']
+    MEDIUM_GRAY = DOC_COLORS['medium_gray']
+    LIGHT_BLUE = DOC_COLORS['light_blue_hex']
+    LIGHT_GRAY = DOC_COLORS['light_gray_hex']
+    ACCENT_BLUE = DOC_COLORS['accent_blue_hex']
+    CREAM_YELLOW = DOC_COLORS['cream_yellow_hex']
+    SOFT_GREEN = DOC_COLORS['soft_green_hex']
 
     # Set default document font
     style = doc.styles['Normal']
@@ -1484,9 +1591,10 @@ def generate_teacher_handout(week_data):
 
     # Save document in week folder
     week_folder = get_week_folder(week_num)
-    unit_slug = unit_name.replace(' ', '_').replace('/', '-')[:20] if unit_name else 'Lessons'
-    filename = f"Week{week_num}_{unit_slug}_TeacherHandout.docx"
-    output_path = os.path.join(week_folder, filename)
+    unit_slug = sanitize_filename(unit_name, max_length=20) if unit_name else 'Lessons'
+    week_str = re.sub(r'[^0-9]', '', str(week_num)).zfill(2)
+    filename = f"Week{week_str}_{unit_slug}_TeacherHandout.docx"
+    output_path = safe_resolve_path(week_folder, filename)
 
     doc.save(output_path)
     return output_path
@@ -1494,21 +1602,17 @@ def generate_teacher_handout(week_data):
 
 def generate_student_handout(handout_data, week_num, handout_name):
     """Generate a Canva-quality student handout with enhanced visual design."""
-    from docx.shared import Inches, Pt
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls
-
     doc = Document()
 
-    # Define colors - Enhanced palette for student handouts
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)
-    LIGHT_BLUE = "D6E3F8"
-    LIGHT_GRAY = "F8F9FA"  # Slightly lighter for more white space feel
-    ACCENT_BLUE = "4A90D9"
-    CREAM_YELLOW = "FFF9E6"
-    SOFT_GREEN = "E8F5E9"
+    # Use shared color palette
+    NAVY_BLUE = DOC_COLORS['navy_blue']
+    DARK_GRAY = DOC_COLORS['dark_gray']
+    MEDIUM_GRAY = DOC_COLORS['medium_gray']
+    LIGHT_BLUE = DOC_COLORS['light_blue_hex']
+    LIGHT_GRAY = "F8F9FA"  # Slightly lighter for student handouts
+    ACCENT_BLUE = DOC_COLORS['accent_blue_hex']
+    CREAM_YELLOW = DOC_COLORS['cream_yellow_hex']
+    SOFT_GREEN = DOC_COLORS['soft_green_hex']
 
     # Set default document font with more spacing
     style = doc.styles['Normal']
@@ -1799,9 +1903,9 @@ def generate_student_handout(handout_data, week_num, handout_name):
 
     # Save document in week folder
     week_folder = get_week_folder(week_num)
-    name_slug = handout_name.replace(' ', '_').replace('/', '-')[:25]
+    name_slug = sanitize_filename(handout_name)
     filename = f"{name_slug}_StudentHandout.docx"
-    output_path = os.path.join(week_folder, filename)
+    output_path = safe_resolve_path(week_folder, filename)
 
     doc.save(output_path)
     return output_path
@@ -1942,8 +2046,9 @@ def generate_bell_ringer_slides(week_data):
 
     # Save presentation in week folder
     week_folder = get_week_folder(week_num)
-    filename = f"Week{week_num}_BellRinger_Slides.pptx"
-    output_path = os.path.join(week_folder, filename)
+    week_str = re.sub(r'[^0-9]', '', str(week_num)).zfill(2)
+    filename = f"Week{week_str}_BellRinger_Slides.pptx"
+    output_path = safe_resolve_path(week_folder, filename)
 
     prs.save(output_path)
     return output_path, slides_created
@@ -2347,9 +2452,9 @@ def generate_daily_presentation(day_data, week_num, day_num, unit_name=''):
 
     # Save presentation
     week_folder = get_week_folder(week_num)
-    topic_slug = topic.replace(' ', '_').replace('/', '-')[:25]
-    filename = f"Day{day_num}_{topic_slug}_Presentation.pptx"
-    output_path = os.path.join(week_folder, filename)
+    topic_slug = sanitize_filename(topic)
+    filename = f"Day{int(day_num)}_{topic_slug}_Presentation.pptx"
+    output_path = safe_resolve_path(week_folder, filename)
 
     prs.save(output_path)
     return output_path, media_log
@@ -2357,6 +2462,8 @@ def generate_daily_presentation(day_data, week_num, day_num, unit_name=''):
 
 def generate_week(data):
     """Generate all documents for a week: CTE plans, teacher handout, student handouts, and daily presentations."""
+    validate_json_data(data)
+
     results = {
         'cte_plans': [],
         'teacher_handout': None,
@@ -2400,7 +2507,9 @@ def generate_week(data):
 
         # Write media log file
         if all_media_log:
-            media_log_path = os.path.join(results['week_folder'], f"Week{week_num}_Media_Log.txt")
+            week_str = re.sub(r'[^0-9]', '', str(week_num)).zfill(2)
+            log_filename = f"Week{week_str}_Media_Log.txt"
+            media_log_path = safe_resolve_path(results['week_folder'], log_filename)
             with open(media_log_path, 'w') as f:
                 f.write(f"Media Log - Week {week_num}: {unit_name}\n")
                 f.write("=" * 60 + "\n\n")
@@ -2418,6 +2527,7 @@ if __name__ == '__main__':
 
     try:
         data = json.loads(sys.argv[1])
+        validate_json_data(data)
 
         # Check if this is a weekly generation or single lesson
         if 'days' in data:
@@ -2444,6 +2554,9 @@ if __name__ == '__main__':
 
     except json.JSONDecodeError as e:
         print(f"ERROR: Invalid JSON - {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"ERROR: Validation failed - {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         import traceback
