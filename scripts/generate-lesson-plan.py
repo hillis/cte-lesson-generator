@@ -10,7 +10,7 @@ Generates:
 
 All files are organized into week-based folders (Week01, Week02, etc.)
 
-Usage: python generate-lesson-plan.py '<json_data>'
+Usage: echo '<json_data>' | python generate-lesson-plan.py
 """
 
 import sys
@@ -20,6 +20,7 @@ import requests
 import tempfile
 import re
 from io import BytesIO
+from urllib.parse import urlparse
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -36,9 +37,6 @@ from pptx.enum.shapes import MSO_SHAPE
 # API KEYS AND CONFIGURATION
 # ============================================================================
 
-# Get Pexels API key from environment variable
-# Set with: export PEXELS_API_KEY='your-api-key'
-# Get a free key at: https://www.pexels.com/api/
 PEXELS_API_KEY = os.environ.get('PEXELS_API_KEY', '')
 
 # Preferred YouTube channels for video search
@@ -75,12 +73,25 @@ UNIT_COLOR_THEMES = {
 DEFAULT_COLOR_THEME = (PptxRGBColor(0x1a, 0x3c, 0x6e), PptxRGBColor(0xD6, 0xE3, 0xF8), PptxRGBColor(0x34, 0x98, 0xDB))
 
 
+# Allowed domains for image downloads (SSRF protection)
+ALLOWED_IMAGE_DOMAINS = {'images.pexels.com'}
+
+
+def sanitize_filename(name, max_length=25):
+    """Remove all characters except alphanumeric, hyphens, and underscores."""
+    sanitized = re.sub(r'[^\w\-]', '_', name)
+    return sanitized[:max_length] or 'Untitled'
+
+
 # ============================================================================
 # PEXELS API FUNCTIONS
 # ============================================================================
 
 def search_pexels_image(query, per_page=1):
     """Search Pexels for an image matching the query. Returns image URL or None."""
+    if not PEXELS_API_KEY:
+        print("Warning: PEXELS_API_KEY not set — skipping image search", file=sys.stderr)
+        return None
     try:
         headers = {'Authorization': PEXELS_API_KEY}
         params = {'query': query, 'per_page': per_page, 'orientation': 'landscape'}
@@ -99,6 +110,10 @@ def search_pexels_image(query, per_page=1):
 
 def download_image(url):
     """Download an image from URL and return as BytesIO object."""
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_IMAGE_DOMAINS:
+        print(f"Image download blocked: {parsed.hostname} not in allowed domains", file=sys.stderr)
+        return None
     try:
         response = requests.get(url, timeout=15)
         if response.status_code == 200:
@@ -193,8 +208,9 @@ def search_youtube_video(topic, preferred_channels=None):
     # Fallback: Try web search
     try:
         import warnings
-        warnings.filterwarnings('ignore')
-        from duckduckgo_search import DDGS
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            from duckduckgo_search import DDGS
 
         search_queries = [
             f'{topic} filmmaking tutorial youtube',
@@ -210,10 +226,11 @@ def search_youtube_video(topic, preferred_channels=None):
                         title = result.get('title', '')
                         if 'youtube.com/watch' in url or 'youtu.be/' in url:
                             return url, title
-                except Exception:
+                except Exception as e:
+                    print(f"DuckDuckGo search error for '{query}': {e}", file=sys.stderr)
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Web search unavailable: {e}", file=sys.stderr)
 
     return None, None
 
@@ -238,17 +255,72 @@ def get_youtube_video_id(url):
     return None
 
 
-# Path to CTE lesson plan template (Word document)
-# Set with: export CTE_TEMPLATE_PATH='/path/to/template.docx'
-# Or place template in ./templates/ directory
-TEMPLATE_PATH = os.environ.get('CTE_TEMPLATE_PATH',
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), 'templates', 'CTE_Lesson_Plan_Template.docx'))
+# ============================================================================
+# PATH CONFIGURATION (Environment-aware)
+# ============================================================================
 
-# Output directory for generated files
-# Set with: export CTE_OUTPUT_DIR='/path/to/output'
-# Defaults to ./output/ in the project directory
-OUTPUT_DIR = os.environ.get('CTE_OUTPUT_DIR',
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output'))
+def get_script_dir():
+    """Get the directory containing this script."""
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        # Fallback if __file__ is not defined (e.g., exec context)
+        return os.getcwd()
+
+def find_template_path():
+    """
+    Find the CTE template file. Checks multiple locations:
+    1. CTE_TEMPLATE_PATH environment variable (explicit override)
+    2. Skill assets folder (relative to script)
+    3. ~/.claude/skills path
+    4. /mnt/skills path (Claude.ai)
+    """
+    possible_paths = []
+
+    # Environment variable override (highest priority)
+    env_path = os.environ.get('CTE_TEMPLATE_PATH', '')
+    if env_path:
+        possible_paths.append(env_path)
+
+    possible_paths.extend([
+        # Skill assets folder (Claude.ai - relative to script)
+        os.path.join(get_script_dir(), '..', 'assets', '2026SpringCTELessonPlanTemplate.docx'),
+        # Alternative skill location
+        os.path.join(get_script_dir(), 'assets', '2026SpringCTELessonPlanTemplate.docx'),
+        # ~/.claude/skills path (Claude Code with skills)
+        os.path.expanduser('~/.claude/skills/cte-lesson/assets/2026SpringCTELessonPlanTemplate.docx'),
+        # /mnt/skills path (Claude.ai)
+        '/mnt/skills/user/cte-lesson/assets/2026SpringCTELessonPlanTemplate.docx',
+    ])
+
+    for path in possible_paths:
+        normalized = os.path.normpath(path)
+        if os.path.exists(normalized):
+            return normalized
+
+    # If no template found, raise an error with helpful message
+    raise FileNotFoundError(
+        "CTE template not found. Checked:\n" +
+        "\n".join(f"  - {p}" for p in possible_paths) +
+        "\n\nPlease ensure the template is in the skill's assets/ folder "
+        "or set CTE_TEMPLATE_PATH."
+    )
+
+def get_output_dir():
+    """
+    Get the output directory. Uses:
+    1. CTE_OUTPUT_DIR environment variable (explicit override)
+    2. Current working directory
+    """
+    env_dir = os.environ.get('CTE_OUTPUT_DIR', '')
+    if env_dir and os.path.isdir(env_dir):
+        return env_dir
+
+    return os.getcwd()
+
+# Set paths using environment detection
+TEMPLATE_PATH = find_template_path()
+OUTPUT_DIR = get_output_dir()
 
 # Checkbox mappings
 MATERIALS_CHECKBOXES = {
@@ -816,991 +888,8 @@ def generate_cte_lesson_plan(day_data, week_num, day_num):
 
     # Generate filename in week folder
     week_folder = get_week_folder(week_num)
-    topic_slug = day_data.get('topic', 'Lesson').replace(' ', '_').replace('/', '-')[:25]
+    topic_slug = sanitize_filename(day_data.get('topic', 'Lesson'))
     filename = f"Day{day_num}_{topic_slug}_CTE.docx"
-    output_path = os.path.join(week_folder, filename)
-
-    doc.save(output_path)
-    return output_path
-
-
-def generate_teacher_handout(week_data):
-    """Generate a professionally styled Canva-quality teacher handout."""
-    from docx.shared import Inches, Pt, Twips
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls, qn
-    from docx.enum.style import WD_STYLE_TYPE
-
-    doc = Document()
-
-    # Define colors - Enhanced palette
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)  # Professional navy
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)  # Body text
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)  # Secondary text
-    LIGHT_BLUE = "D6E3F8"  # Light blue for backgrounds
-    LIGHT_GRAY = "F5F5F5"  # Alternating row color
-    ACCENT_BLUE = "4A90D9"  # Brighter accent blue
-    CREAM_YELLOW = "FFF9E6"  # Light yellow for notes
-    SOFT_GREEN = "E8F5E9"  # Soft green for tips
-
-    # Set default document font
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(11)
-    style.font.color.rgb = DARK_GRAY
-    style.paragraph_format.space_after = Pt(6)
-    style.paragraph_format.line_spacing = 1.15
-
-    # Set margins
-    sections = doc.sections
-    for section in sections:
-        section.top_margin = Inches(0.6)
-        section.bottom_margin = Inches(0.6)
-        section.left_margin = Inches(0.7)
-        section.right_margin = Inches(0.7)
-
-    week_num = week_data.get('week', '')
-    unit_name = week_data.get('unit', '')
-
-    # === HEADER BANNER (Full-width with accent bar) ===
-    header_table = doc.add_table(rows=2, cols=1)
-    header_table.style = 'Table Grid'
-
-    # Accent bar (thin top bar)
-    accent_cell = header_table.rows[0].cells[0]
-    accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-    accent_cell._tc.get_or_add_tcPr().append(accent_shading)
-    accent_p = accent_cell.paragraphs[0]
-    accent_p.paragraph_format.space_after = Pt(0)
-    # Make row very short
-    tr = header_table.rows[0]._tr
-    trPr = tr.get_or_add_trPr()
-    trHeight = parse_xml(f'<w:trHeight {nsdecls("w")} w:val="100" w:hRule="exact"/>')
-    trPr.append(trHeight)
-
-    # Main header cell
-    main_cell = header_table.rows[1].cells[0]
-    main_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-    main_cell._tc.get_or_add_tcPr().append(main_shading)
-
-    # Week number badge
-    p = main_cell.paragraphs[0]
-    run = p.add_run(f"WEEK {week_num}")
-    run.bold = True
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
-    run.font.name = 'Calibri'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(2)
-
-    # Unit title
-    p = main_cell.add_paragraph()
-    run = p.add_run(unit_name)
-    run.bold = True
-    run.font.size = Pt(28)
-    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.name = 'Cambria'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(4)
-    p.paragraph_format.space_after = Pt(4)
-
-    # Subtitle
-    p = main_cell.add_paragraph()
-    run = p.add_run("Media Foundations · Teacher Guide")
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
-    run.font.name = 'Calibri'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(8)
-
-    doc.add_paragraph()
-
-    # === Helper function for styled section headers with icons and sidebar ===
-    def add_section_header(text, level=1):
-        """Add a section header with left accent bar."""
-        # Create a table for sidebar effect
-        header_tbl = doc.add_table(rows=1, cols=2)
-        header_tbl.autofit = False
-
-        # Sidebar cell (accent bar)
-        sidebar_cell = header_tbl.rows[0].cells[0]
-        sidebar_cell.width = Inches(0.08)
-        sidebar_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        sidebar_cell._tc.get_or_add_tcPr().append(sidebar_shading)
-
-        # Content cell
-        content_cell = header_tbl.rows[0].cells[1]
-        content_cell.width = Inches(6.8)
-
-        p = content_cell.paragraphs[0]
-
-        run = p.add_run(text)
-        run.bold = True
-        run.font.color.rgb = NAVY_BLUE
-        if level == 1:
-            run.font.size = Pt(16)
-            run.font.name = 'Cambria'
-            p.paragraph_format.space_before = Pt(4)
-            p.paragraph_format.space_after = Pt(4)
-        else:
-            run.font.size = Pt(13)
-            run.font.name = 'Cambria'
-            p.paragraph_format.space_before = Pt(2)
-            p.paragraph_format.space_after = Pt(2)
-
-        return p
-
-    # === Helper function for card-style boxes ===
-    def add_card_box(content, bg_color=LIGHT_BLUE, border_color="1A3C6E"):
-        """Create a card-style box with colored background."""
-        card_table = doc.add_table(rows=1, cols=1)
-        card_table.style = 'Table Grid'
-        cell = card_table.rows[0].cells[0]
-
-        # Background color
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{bg_color}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
-
-        # Add content
-        p = cell.paragraphs[0]
-        if isinstance(content, str):
-            run = p.add_run(content)
-            run.font.color.rgb = DARK_GRAY
-
-        return cell
-
-    # === Helper function for pull-quote/tip boxes ===
-    def add_tip_box(content, tip_type="tip"):
-        """Create a styled tip/note box."""
-        tip_colors = {'tip': SOFT_GREEN, 'warning': "FFF3CD", 'note': CREAM_YELLOW, 'important': "FFEBEE"}
-
-        box_color = tip_colors.get(tip_type, CREAM_YELLOW)
-
-        tip_table = doc.add_table(rows=1, cols=1)
-        tip_table.style = 'Table Grid'
-        cell = tip_table.rows[0].cells[0]
-
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{box_color}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
-
-        p = cell.paragraphs[0]
-        run = p.add_run(content)
-        run.font.color.rgb = DARK_GRAY
-        run.font.size = Pt(10)
-
-        return cell
-
-    # === Helper function for styled tables ===
-    def style_table(table, header_color=LIGHT_BLUE):
-        # Set table width to full page
-        table.autofit = True
-
-        # Style header row
-        if table.rows:
-            for cell in table.rows[0].cells:
-                # Set background color for header
-                shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{header_color}" w:val="clear"/>')
-                cell._tc.get_or_add_tcPr().append(shading)
-                # Style header text
-                for para in cell.paragraphs:
-                    for run in para.runs:
-                        run.bold = True
-                        run.font.size = Pt(11)
-                        run.font.color.rgb = NAVY_BLUE
-
-    # === WEEK OVERVIEW BOX (Card style with sidebar accent) ===
-    if week_data.get('week_overview') or week_data.get('week_focus'):
-        add_section_header("Week Overview", level=1)
-
-        overview_table = doc.add_table(rows=1, cols=1)
-        overview_table.style = 'Table Grid'
-
-        # Style the overview box with light blue background
-        cell = overview_table.rows[0].cells[0]
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
-
-        # Focus line with emphasis
-        if week_data.get('week_focus'):
-            p = cell.paragraphs[0]
-            run = p.add_run("Focus: ")
-            run.bold = True
-            run.font.size = Pt(12)
-            run.font.color.rgb = NAVY_BLUE
-            focus_run = p.add_run(week_data['week_focus'])
-            focus_run.font.color.rgb = DARK_GRAY
-            focus_run.font.size = Pt(11)
-            p.paragraph_format.space_after = Pt(8)
-
-        # Overview content
-        if week_data.get('week_overview'):
-            p = cell.add_paragraph() if week_data.get('week_focus') else cell.paragraphs[0]
-            run = p.add_run(week_data['week_overview'])
-            run.font.color.rgb = DARK_GRAY
-            run.font.size = Pt(11)
-
-        doc.add_paragraph()
-
-    # === WEEKLY LEARNING OBJECTIVES ===
-    if week_data.get('week_objectives'):
-        add_section_header("Weekly Learning Objectives", level=1)
-
-        # Create a styled card for objectives
-        obj_table = doc.add_table(rows=0, cols=2)
-        obj_table.style = 'Table Grid'
-        obj_table.autofit = False
-
-        for idx, obj in enumerate(week_data['week_objectives']):
-            row = obj_table.add_row()
-
-            # Number badge cell
-            num_cell = row.cells[0]
-            num_cell.width = Inches(0.4)
-            p = num_cell.paragraphs[0]
-            run = p.add_run(str(idx + 1))
-            run.bold = True
-            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-            run.font.size = Pt(11)
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            # Navy circle background
-            num_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-            num_cell._tc.get_or_add_tcPr().append(num_shading)
-
-            # Objective text cell
-            text_cell = row.cells[1]
-            p = text_cell.paragraphs[0]
-            run = p.add_run(obj)
-            run.font.color.rgb = DARK_GRAY
-            run.font.size = Pt(11)
-
-        doc.add_paragraph()
-
-    # === MATERIALS NEEDED FOR THE WEEK ===
-    if week_data.get('week_materials'):
-        add_section_header("Materials Needed for the Week", level=1)
-
-        # Two-column layout for materials
-        mat_table = doc.add_table(rows=0, cols=2)
-        mat_table.style = 'Table Grid'
-        mat_table.autofit = False
-
-        materials = week_data['week_materials']
-        for i in range(0, len(materials), 2):
-            row = mat_table.add_row()
-            for j in range(2):
-                if i + j < len(materials):
-                    cell = row.cells[j]
-                    cell.width = Inches(3.4)
-                    p = cell.paragraphs[0]
-                    run = p.add_run(f"[ ] {materials[i + j]}")
-                    run.font.color.rgb = DARK_GRAY
-                    run.font.size = Pt(11)
-                    # Alternating row color
-                    if (i // 2) % 2 == 1:
-                        mat_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                        cell._tc.get_or_add_tcPr().append(mat_shading)
-
-        doc.add_paragraph()
-
-    # === ASSESSMENT OVERVIEW ===
-    if week_data.get('assessment_overview') or week_data.get('formative_assessment') or week_data.get('summative_assessment') or week_data.get('weekly_deliverable'):
-        add_section_header("Assessment Overview", level=1)
-
-        # Create assessment cards in a 3-column layout
-        assessment_table = doc.add_table(rows=1, cols=3)
-        assessment_table.style = 'Table Grid'
-        assessment_table.autofit = False
-
-        # Define assessment items with icons
-        assessments = [
-            ('formative_assessment', 'Formative', LIGHT_BLUE),
-            ('summative_assessment', 'Summative', SOFT_GREEN),
-            ('weekly_deliverable', 'Deliverable', CREAM_YELLOW),
-        ]
-
-        for idx, (key, label, color) in enumerate(assessments):
-            if week_data.get(key):
-                cell = assessment_table.rows[0].cells[idx]
-                cell.width = Inches(2.2)
-
-                # Background color
-                shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color}" w:val="clear"/>')
-                cell._tc.get_or_add_tcPr().append(shading)
-
-                # Label
-                p = cell.paragraphs[0]
-                run = p.add_run(label)
-                run.bold = True
-                run.font.size = Pt(11)
-                run.font.color.rgb = NAVY_BLUE
-                p.paragraph_format.space_after = Pt(6)
-
-                # Content
-                p = cell.add_paragraph()
-                run = p.add_run(week_data[key])
-                run.font.size = Pt(10)
-                run.font.color.rgb = DARK_GRAY
-
-        doc.add_paragraph()
-
-    # === DAILY SECTIONS ===
-    days = week_data.get('days', [])
-    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-
-    for i, day in enumerate(days, 1):
-        doc.add_page_break()
-
-        # Day header - Tab-style banner with topic
-        day_name = day.get('day_label') or (day_names[i-1] if i <= len(day_names) else f"Day {i}")
-
-        # Create tab-style header with day badge + topic bar
-        day_header_table = doc.add_table(rows=1, cols=2)
-        day_header_table.style = 'Table Grid'
-        day_header_table.autofit = False
-
-        # Day number "tab"
-        tab_cell = day_header_table.rows[0].cells[0]
-        tab_cell.width = Inches(1.2)
-        tab_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        tab_cell._tc.get_or_add_tcPr().append(tab_shading)
-
-        p = tab_cell.paragraphs[0]
-        run = p.add_run(f"DAY {i}")
-        run.bold = True
-        run.font.size = Pt(14)
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        run.font.name = 'Cambria'
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-        p = tab_cell.add_paragraph()
-        run = p.add_run(day_name)
-        run.font.size = Pt(10)
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-        # Topic bar
-        topic_cell = day_header_table.rows[0].cells[1]
-        topic_cell.width = Inches(5.7)
-        topic_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-        topic_cell._tc.get_or_add_tcPr().append(topic_shading)
-
-        p = topic_cell.paragraphs[0]
-        run = p.add_run(day.get('topic', 'Untitled'))
-        run.bold = True
-        run.font.size = Pt(18)
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        run.font.name = 'Cambria'
-        p.paragraph_format.space_before = Pt(8)
-        p.paragraph_format.space_after = Pt(8)
-        # Vertically center - left align
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-        doc.add_paragraph()  # Spacing after header
-
-        # Learning Objectives (compact card style)
-        if day.get('objectives'):
-            add_section_header("Learning Objectives", level=2)
-
-            obj_box = doc.add_table(rows=1, cols=1)
-            obj_box.style = 'Table Grid'
-            obj_cell = obj_box.rows[0].cells[0]
-            obj_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-            obj_cell._tc.get_or_add_tcPr().append(obj_shading)
-
-            for idx, obj in enumerate(day['objectives']):
-                p = obj_cell.paragraphs[0] if idx == 0 else obj_cell.add_paragraph()
-                run = p.add_run(obj)
-                run.font.color.rgb = DARK_GRAY
-                run.font.size = Pt(10)
-                p.paragraph_format.space_after = Pt(2)
-
-        # Materials (inline badges style)
-        if day.get('day_materials'):
-            add_section_header("Materials", level=2)
-
-            p = doc.add_paragraph()
-            for idx, mat in enumerate(day['day_materials']):
-                if idx > 0:
-                    p.add_run("  •  ").font.color.rgb = MEDIUM_GRAY
-                run = p.add_run(mat)
-                run.font.color.rgb = DARK_GRAY
-                run.font.size = Pt(10)
-
-        # Schedule Table (90 minutes) - Enhanced with highlighted time column
-        if day.get('schedule') or day.get('activities'):
-            add_section_header("Schedule (90 minutes)", level=2)
-
-            activities = day.get('schedule') or day.get('activities', [])
-            if activities:
-                schedule_table = doc.add_table(rows=1, cols=3)
-                schedule_table.style = 'Table Grid'
-                schedule_table.autofit = False
-
-                # Header row with enhanced styling
-                header_cells = schedule_table.rows[0].cells
-                header_texts = ["Time", "Activity", "Details"]
-                for idx, header_text in enumerate(header_texts):
-                    run = header_cells[idx].paragraphs[0].add_run(header_text)
-                    run.bold = True
-                    run.font.size = Pt(11)
-                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                    # Navy header background
-                    h_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-                    header_cells[idx]._tc.get_or_add_tcPr().append(h_shading)
-
-                # Set column widths
-                header_cells[0].width = Inches(0.9)
-                header_cells[1].width = Inches(1.8)
-                header_cells[2].width = Inches(4.2)
-
-                # Add activity rows with highlighted time column
-                for row_idx, activity in enumerate(activities):
-                    row = schedule_table.add_row()
-                    cells = row.cells
-
-                    if isinstance(activity, dict):
-                        # Time cell - always highlighted with accent color
-                        time_text = activity.get('time', activity.get('duration', ''))
-                        p = cells[0].paragraphs[0]
-                        run = p.add_run(time_text)
-                        run.bold = True
-                        run.font.size = Pt(10)
-                        run.font.color.rgb = NAVY_BLUE
-                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        time_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-                        cells[0]._tc.get_or_add_tcPr().append(time_shading)
-
-                        # Activity name - bold
-                        p = cells[1].paragraphs[0]
-                        run = p.add_run(activity.get('name', activity.get('activity', '')))
-                        run.bold = True
-                        run.font.size = Pt(10)
-                        run.font.color.rgb = DARK_GRAY
-
-                        # Description
-                        p = cells[2].paragraphs[0]
-                        run = p.add_run(activity.get('description', ''))
-                        run.font.size = Pt(10)
-                        run.font.color.rgb = DARK_GRAY
-                    else:
-                        cells[1].text = str(activity)
-
-                    # Alternating row colors for non-time cells
-                    if row_idx % 2 == 1:
-                        for cell in cells[1:]:  # Skip time column
-                            row_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                            cell._tc.get_or_add_tcPr().append(row_shading)
-
-            doc.add_paragraph()
-
-        # Key Vocabulary - Card-style two-column layout
-        if day.get('vocabulary'):
-            add_section_header("Key Vocabulary", level=2)
-
-            vocab_items = list(day['vocabulary'].items())
-            vocab_table = doc.add_table(rows=0, cols=2)
-            vocab_table.style = 'Table Grid'
-            vocab_table.autofit = False
-
-            # Create vocabulary cards in two columns
-            for i in range(0, len(vocab_items), 2):
-                row = vocab_table.add_row()
-                for j in range(2):
-                    if i + j < len(vocab_items):
-                        term, definition = vocab_items[i + j]
-                        cell = row.cells[j]
-                        cell.width = Inches(3.4)
-
-                        # Card background
-                        card_bg = LIGHT_BLUE if (i // 2) % 2 == 0 else LIGHT_GRAY
-                        v_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{card_bg}" w:val="clear"/>')
-                        cell._tc.get_or_add_tcPr().append(v_shading)
-
-                        # Term (bold, navy)
-                        p = cell.paragraphs[0]
-                        run = p.add_run(term)
-                        run.bold = True
-                        run.font.size = Pt(11)
-                        run.font.color.rgb = NAVY_BLUE
-                        p.paragraph_format.space_after = Pt(4)
-
-                        # Definition
-                        p = cell.add_paragraph()
-                        run = p.add_run(definition)
-                        run.font.size = Pt(10)
-                        run.font.color.rgb = DARK_GRAY
-
-            doc.add_paragraph()
-
-        # Differentiation Strategies - Three-column card layout
-        if day.get('differentiation'):
-            add_section_header("Differentiation Strategies", level=2)
-
-            diff = day['differentiation']
-            if isinstance(diff, dict):
-                diff_table = doc.add_table(rows=1, cols=len(diff))
-                diff_table.style = 'Table Grid'
-                diff_table.autofit = False
-
-                # Color coding for differentiation levels
-                diff_colors = {
-                    'Struggling': "FFEBEE",  # Light red
-                    'On-Level': LIGHT_BLUE,  # Light blue
-                    'Advanced': SOFT_GREEN,  # Light green
-                    'ELL': "FFF3E0",  # Light orange
-                }
-
-                for idx, (level, strategy) in enumerate(diff.items()):
-                    cell = diff_table.rows[0].cells[idx]
-                    cell.width = Inches(6.8 / len(diff))
-
-                    # Get color for level
-                    bg_color = diff_colors.get(level, LIGHT_GRAY)
-                    d_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{bg_color}" w:val="clear"/>')
-                    cell._tc.get_or_add_tcPr().append(d_shading)
-
-                    # Level label
-                    p = cell.paragraphs[0]
-                    run = p.add_run(level)
-                    run.bold = True
-                    run.font.size = Pt(11)
-                    run.font.color.rgb = NAVY_BLUE
-                    p.paragraph_format.space_after = Pt(4)
-
-                    # Strategy
-                    p = cell.add_paragraph()
-                    run = p.add_run(strategy)
-                    run.font.size = Pt(10)
-                    run.font.color.rgb = DARK_GRAY
-            else:
-                p = doc.add_paragraph()
-                run = p.add_run(diff)
-                run.font.color.rgb = DARK_GRAY
-
-            doc.add_paragraph()
-
-        # Teacher Notes (Sticky-note style box)
-        if day.get('teacher_notes'):
-            add_section_header("Teacher Notes", level=2)
-
-            # Create sticky-note style box with slight rotation effect
-            note_table = doc.add_table(rows=1, cols=2)
-            note_table.style = 'Table Grid'
-            note_table.autofit = False
-
-            # Left accent bar (like a post-it tab)
-            tab_cell = note_table.rows[0].cells[0]
-            tab_cell.width = Inches(0.15)
-            tab_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="FFD93D" w:val="clear"/>')  # Yellow tab
-            tab_cell._tc.get_or_add_tcPr().append(tab_shading)
-
-            # Note content
-            note_cell = note_table.rows[0].cells[1]
-            note_cell.width = Inches(6.65)
-            note_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{CREAM_YELLOW}" w:val="clear"/>')
-            note_cell._tc.get_or_add_tcPr().append(note_shading)
-
-            p = note_cell.paragraphs[0]
-            run = p.add_run(day['teacher_notes'])
-            run.font.color.rgb = DARK_GRAY
-            run.font.size = Pt(10)
-            run.font.italic = True
-
-            doc.add_paragraph()
-
-    # === END OF WEEK SECTIONS ===
-
-    # Week Vocabulary Summary
-    if week_data.get('vocabulary_summary'):
-        doc.add_page_break()
-        add_section_header("Week Vocabulary Summary", level=1)
-
-        # Card layout for vocabulary categories
-        for category, terms in week_data['vocabulary_summary'].items():
-            cat_table = doc.add_table(rows=1, cols=1)
-            cat_table.style = 'Table Grid'
-            cell = cat_table.rows[0].cells[0]
-            cat_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-            cell._tc.get_or_add_tcPr().append(cat_shading)
-
-            p = cell.paragraphs[0]
-            run = p.add_run(category)
-            run.bold = True
-            run.font.size = Pt(12)
-            run.font.color.rgb = NAVY_BLUE
-            p.paragraph_format.space_after = Pt(4)
-
-            p = cell.add_paragraph()
-            run = p.add_run(terms)
-            run.font.size = Pt(10)
-            run.font.color.rgb = DARK_GRAY
-
-            doc.add_paragraph()
-
-    # Teacher Notes (end of week) - Pull-quote box style
-    if week_data.get('teacher_notes'):
-        add_section_header("Teacher Notes", level=1)
-
-        notes_table = doc.add_table(rows=1, cols=2)
-        notes_table.style = 'Table Grid'
-        notes_table.autofit = False
-
-        # Yellow accent bar
-        accent_cell = notes_table.rows[0].cells[0]
-        accent_cell.width = Inches(0.15)
-        accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="FFD93D" w:val="clear"/>')
-        accent_cell._tc.get_or_add_tcPr().append(accent_shading)
-
-        # Notes content
-        notes_cell = notes_table.rows[0].cells[1]
-        notes_cell.width = Inches(6.65)
-        notes_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{CREAM_YELLOW}" w:val="clear"/>')
-        notes_cell._tc.get_or_add_tcPr().append(notes_shading)
-
-        for idx, note in enumerate(week_data['teacher_notes']):
-            p = notes_cell.paragraphs[0] if idx == 0 else notes_cell.add_paragraph()
-            run = p.add_run(f"• {note}")
-            run.font.color.rgb = DARK_GRAY
-            run.font.size = Pt(10)
-            run.font.italic = True
-
-        doc.add_paragraph()
-
-    # Standards Alignment - Professional footer style
-    if week_data.get('standards_alignment'):
-        add_section_header("Standards Alignment", level=1)
-
-        std_table = doc.add_table(rows=1, cols=1)
-        std_table.style = 'Table Grid'
-        cell = std_table.rows[0].cells[0]
-        std_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(std_shading)
-
-        p = cell.paragraphs[0]
-        run = p.add_run(week_data['standards_alignment'])
-        run.font.color.rgb = MEDIUM_GRAY
-        run.font.size = Pt(9)
-        run.font.italic = True
-
-    # Save document in week folder
-    week_folder = get_week_folder(week_num)
-    unit_slug = unit_name.replace(' ', '_').replace('/', '-')[:20] if unit_name else 'Lessons'
-    filename = f"Week{week_num}_{unit_slug}_TeacherHandout.docx"
-    output_path = os.path.join(week_folder, filename)
-
-    doc.save(output_path)
-    return output_path
-
-
-def generate_student_handout(handout_data, week_num, handout_name):
-    """Generate a Canva-quality student handout with enhanced visual design."""
-    from docx.shared import Inches, Pt
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import nsdecls
-
-    doc = Document()
-
-    # Define colors - Enhanced palette for student handouts
-    NAVY_BLUE = RGBColor(0x1a, 0x3c, 0x6e)
-    DARK_GRAY = RGBColor(0x33, 0x33, 0x33)
-    MEDIUM_GRAY = RGBColor(0x66, 0x66, 0x66)
-    LIGHT_BLUE = "D6E3F8"
-    LIGHT_GRAY = "F8F9FA"  # Slightly lighter for more white space feel
-    ACCENT_BLUE = "4A90D9"
-    CREAM_YELLOW = "FFF9E6"
-    SOFT_GREEN = "E8F5E9"
-
-    # Set default document font with more spacing
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(11)
-    style.font.color.rgb = DARK_GRAY
-    style.paragraph_format.space_after = Pt(8)  # More space
-    style.paragraph_format.line_spacing = 1.25  # More breathing room
-
-    # Set margins - slightly more generous for cleaner look
-    for section in doc.sections:
-        section.top_margin = Inches(0.7)
-        section.bottom_margin = Inches(0.7)
-        section.left_margin = Inches(0.8)
-        section.right_margin = Inches(0.8)
-
-    # === Helper function for section headers with sidebar accent ===
-    def add_section_header(text):
-        """Add a section header with left accent bar."""
-        header_tbl = doc.add_table(rows=1, cols=2)
-        header_tbl.autofit = False
-
-        # Sidebar accent bar
-        sidebar_cell = header_tbl.rows[0].cells[0]
-        sidebar_cell.width = Inches(0.08)
-        sidebar_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-        sidebar_cell._tc.get_or_add_tcPr().append(sidebar_shading)
-
-        # Content cell
-        content_cell = header_tbl.rows[0].cells[1]
-        content_cell.width = Inches(6.4)
-
-        p = content_cell.paragraphs[0]
-
-        run = p.add_run(text)
-        run.bold = True
-        run.font.size = Pt(15)
-        run.font.color.rgb = NAVY_BLUE
-        run.font.name = 'Cambria'
-        p.paragraph_format.space_before = Pt(4)
-        p.paragraph_format.space_after = Pt(4)
-
-        return p
-
-    # === HEADER BANNER (Enhanced with accent bar) ===
-    header_table = doc.add_table(rows=2, cols=1)
-    header_table.style = 'Table Grid'
-
-    # Accent bar (thin top bar)
-    accent_cell = header_table.rows[0].cells[0]
-    accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{ACCENT_BLUE}" w:val="clear"/>')
-    accent_cell._tc.get_or_add_tcPr().append(accent_shading)
-    accent_p = accent_cell.paragraphs[0]
-    accent_p.paragraph_format.space_after = Pt(0)
-    tr = header_table.rows[0]._tr
-    trPr = tr.get_or_add_trPr()
-    trHeight = parse_xml(f'<w:trHeight {nsdecls("w")} w:val="100" w:hRule="exact"/>')
-    trPr.append(trHeight)
-
-    # Main header cell
-    main_cell = header_table.rows[1].cells[0]
-    main_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-    main_cell._tc.get_or_add_tcPr().append(main_shading)
-
-    # Title
-    p = main_cell.paragraphs[0]
-    run = p.add_run(handout_data.get('title', 'Student Handout'))
-    run.bold = True
-    run.font.size = Pt(24)
-    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    run.font.name = 'Cambria'
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(8)
-    p.paragraph_format.space_after = Pt(4)
-
-    # Subtitle if provided
-    if handout_data.get('subtitle'):
-        p = main_cell.add_paragraph()
-        run = p.add_run(handout_data['subtitle'])
-        run.font.size = Pt(12)
-        run.font.color.rgb = RGBColor(0xD6, 0xE3, 0xF8)
-        run.font.name = 'Calibri'
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(8)
-
-    doc.add_paragraph()  # Extra spacing
-
-    # === INSTRUCTIONS BOX (Card style) ===
-    if handout_data.get('instructions'):
-        add_section_header("Instructions")
-
-        inst_table = doc.add_table(rows=1, cols=1)
-        inst_table.style = 'Table Grid'
-        cell = inst_table.rows[0].cells[0]
-        shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_BLUE}" w:val="clear"/>')
-        cell._tc.get_or_add_tcPr().append(shading)
-
-        p = cell.paragraphs[0]
-        run = p.add_run(handout_data['instructions'])
-        run.font.color.rgb = DARK_GRAY
-        run.font.size = Pt(11)
-
-        doc.add_paragraph()
-
-    # === MAIN CONTENT SECTIONS ===
-    for section in handout_data.get('sections', []):
-        heading = section.get('heading', '')
-        add_section_header(heading if heading else "Content")
-
-        if section.get('content'):
-            p = doc.add_paragraph()
-            run = p.add_run(section['content'])
-            run.font.color.rgb = DARK_GRAY
-            run.font.size = Pt(11)
-            p.paragraph_format.space_after = Pt(10)
-
-        if section.get('items'):
-            # Use circular badge numbered items or clean bullets
-            if section.get('numbered'):
-                items_table = doc.add_table(rows=0, cols=2)
-                items_table.style = 'Table Grid'
-                items_table.autofit = False
-
-                for idx, item in enumerate(section['items'], 1):
-                    row = items_table.add_row()
-
-                    # Circular number badge cell
-                    num_cell = row.cells[0]
-                    num_cell.width = Inches(0.45)
-                    p = num_cell.paragraphs[0]
-                    run = p.add_run(str(idx))
-                    run.bold = True
-                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                    run.font.size = Pt(12)
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    # Navy background for circular effect
-                    badge_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-                    num_cell._tc.get_or_add_tcPr().append(badge_shading)
-
-                    # Content cell with alternating subtle background
-                    content_cell = row.cells[1]
-                    content_cell.width = Inches(6.05)
-                    p = content_cell.paragraphs[0]
-                    run = p.add_run(item)
-                    run.font.color.rgb = DARK_GRAY
-                    run.font.size = Pt(11)
-
-                    if idx % 2 == 0:
-                        row_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                        content_cell._tc.get_or_add_tcPr().append(row_shading)
-            else:
-                for item in section['items']:
-                    p = doc.add_paragraph()
-                    run = p.add_run(f"• {item}")
-                    run.font.color.rgb = DARK_GRAY
-                    run.font.size = Pt(11)
-                    p.paragraph_format.left_indent = Inches(0.25)
-
-        # Blank lines for writing (styled with subtle gray)
-        if section.get('blank_lines'):
-            doc.add_paragraph()
-            for _ in range(section['blank_lines']):
-                p = doc.add_paragraph()
-                run = p.add_run('_' * 85)
-                run.font.color.rgb = RGBColor(0xDD, 0xDD, 0xDD)
-                p.paragraph_format.space_after = Pt(14)
-
-        doc.add_paragraph()
-
-    # === QUESTIONS SECTION (Enhanced with number badges) ===
-    if handout_data.get('questions'):
-        add_section_header("Questions")
-
-        for i, q in enumerate(handout_data['questions'], 1):
-            q_table = doc.add_table(rows=1, cols=2)
-            q_table.style = 'Table Grid'
-            q_table.autofit = False
-
-            # Question number badge
-            num_cell = q_table.rows[0].cells[0]
-            num_cell.width = Inches(0.5)
-            badge_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="1A3C6E" w:val="clear"/>')
-            num_cell._tc.get_or_add_tcPr().append(badge_shading)
-
-            p = num_cell.paragraphs[0]
-            run = p.add_run(str(i))
-            run.bold = True
-            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-            run.font.size = Pt(14)
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-            # Question and answer area
-            q_cell = q_table.rows[0].cells[1]
-            q_cell.width = Inches(6.0)
-
-            # Alternating background
-            if i % 2 == 0:
-                q_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{LIGHT_GRAY}" w:val="clear"/>')
-                q_cell._tc.get_or_add_tcPr().append(q_shading)
-
-            # Question text
-            p = q_cell.paragraphs[0]
-            run = p.add_run(q)
-            run.font.color.rgb = DARK_GRAY
-            run.font.size = Pt(11)
-            p.paragraph_format.space_after = Pt(10)
-
-            # Answer lines
-            for _ in range(3):
-                p = q_cell.add_paragraph()
-                run = p.add_run('_' * 80)
-                run.font.color.rgb = RGBColor(0xDD, 0xDD, 0xDD)
-                p.paragraph_format.space_after = Pt(8)
-
-            doc.add_paragraph()
-
-    # === VOCABULARY SECTION (Two-column card layout) ===
-    if handout_data.get('vocabulary'):
-        add_section_header("Vocabulary")
-
-        vocab_items = list(handout_data['vocabulary'].items())
-        vocab_table = doc.add_table(rows=0, cols=2)
-        vocab_table.style = 'Table Grid'
-        vocab_table.autofit = False
-
-        # Create vocabulary cards in two columns
-        for i in range(0, len(vocab_items), 2):
-            row = vocab_table.add_row()
-            for j in range(2):
-                if i + j < len(vocab_items):
-                    term, definition = vocab_items[i + j]
-                    cell = row.cells[j]
-                    cell.width = Inches(3.25)
-
-                    # Card background - alternating colors
-                    card_bg = LIGHT_BLUE if (i // 2) % 2 == 0 else LIGHT_GRAY
-                    v_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{card_bg}" w:val="clear"/>')
-                    cell._tc.get_or_add_tcPr().append(v_shading)
-
-                    # Term (bold, navy)
-                    p = cell.paragraphs[0]
-                    run = p.add_run(term)
-                    run.bold = True
-                    run.font.size = Pt(11)
-                    run.font.color.rgb = NAVY_BLUE
-                    p.paragraph_format.space_after = Pt(4)
-
-                    # Definition
-                    p = cell.add_paragraph()
-                    run = p.add_run(definition)
-                    run.font.size = Pt(10)
-                    run.font.color.rgb = DARK_GRAY
-
-        doc.add_paragraph()
-
-    # === TIPS/NOTES SECTION (Pull-quote style with accent) ===
-    if handout_data.get('tips') or handout_data.get('notes'):
-        add_section_header("Tips & Notes")
-
-        tips_table = doc.add_table(rows=1, cols=2)
-        tips_table.style = 'Table Grid'
-        tips_table.autofit = False
-
-        # Yellow accent bar (like a highlight strip)
-        accent_cell = tips_table.rows[0].cells[0]
-        accent_cell.width = Inches(0.12)
-        accent_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="FFD93D" w:val="clear"/>')
-        accent_cell._tc.get_or_add_tcPr().append(accent_shading)
-
-        # Content cell
-        content_cell = tips_table.rows[0].cells[1]
-        content_cell.width = Inches(6.38)
-        content_shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{CREAM_YELLOW}" w:val="clear"/>')
-        content_cell._tc.get_or_add_tcPr().append(content_shading)
-
-        tips = handout_data.get('tips') or handout_data.get('notes', [])
-        if isinstance(tips, list):
-            for idx, tip in enumerate(tips):
-                p = content_cell.paragraphs[0] if idx == 0 else content_cell.add_paragraph()
-                run = p.add_run(f"- {tip}")
-                run.font.color.rgb = DARK_GRAY
-                run.font.size = Pt(10)
-        else:
-            p = content_cell.paragraphs[0]
-            run = p.add_run(tips)
-            run.font.color.rgb = DARK_GRAY
-            run.font.size = Pt(10)
-
-    # Save document in week folder
-    week_folder = get_week_folder(week_num)
-    name_slug = handout_name.replace(' ', '_').replace('/', '-')[:25]
-    filename = f"{name_slug}_StudentHandout.docx"
     output_path = os.path.join(week_folder, filename)
 
     doc.save(output_path)
@@ -2347,7 +1436,7 @@ def generate_daily_presentation(day_data, week_num, day_num, unit_name=''):
 
     # Save presentation
     week_folder = get_week_folder(week_num)
-    topic_slug = topic.replace(' ', '_').replace('/', '-')[:25]
+    topic_slug = sanitize_filename(topic)
     filename = f"Day{day_num}_{topic_slug}_Presentation.pptx"
     output_path = os.path.join(week_folder, filename)
 
@@ -2356,11 +1445,13 @@ def generate_daily_presentation(day_data, week_num, day_num, unit_name=''):
 
 
 def generate_week(data):
-    """Generate all documents for a week: CTE plans, teacher handout, student handouts, and daily presentations."""
+    """Generate all documents for a week: CTE lesson plans and daily presentations.
+    
+    Note: Teacher and Student handouts should be generated separately using the docx skill.
+    See templates/teacher-handout.js and templates/student-handout.js for reference.
+    """
     results = {
         'cte_plans': [],
-        'teacher_handout': None,
-        'student_handouts': [],
         'daily_presentations': [],
         'media_log': [],
         'week_folder': None
@@ -2379,13 +1470,8 @@ def generate_week(data):
         path = generate_cte_lesson_plan(day, week_num, i)
         results['cte_plans'].append(path)
 
-    # Generate teacher handout
-    results['teacher_handout'] = generate_teacher_handout(data)
-
-    # Generate student handouts
-    for handout in data.get('student_handouts', []):
-        path = generate_student_handout(handout, week_num, handout.get('name', 'Handout'))
-        results['student_handouts'].append(path)
+    # NOTE: Teacher and Student handouts should be generated separately using the docx skill
+    # See templates/teacher-handout.js and templates/student-handout.js for reference
 
     # Generate daily lesson presentations (unless skip_presentations is True)
     all_media_log = []
@@ -2411,13 +1497,54 @@ def generate_week(data):
     return results
 
 
+def validate_input(data):
+    """Validate input data fields and apply reasonable limits."""
+    MAX_DAYS = 7
+    MAX_STRING_LEN = 500
+
+    if not isinstance(data, dict):
+        raise ValueError("Input must be a JSON object")
+
+    # Validate 'week' field
+    if 'week' in data:
+        week = data['week']
+        if not isinstance(week, (str, int)):
+            raise ValueError("'week' must be a string or integer")
+
+    # Validate and cap 'days' array
+    if 'days' in data:
+        if not isinstance(data['days'], list):
+            raise ValueError("'days' must be an array")
+        if len(data['days']) > MAX_DAYS:
+            print(f"Warning: Capping days from {len(data['days'])} to {MAX_DAYS}", file=sys.stderr)
+            data['days'] = data['days'][:MAX_DAYS]
+
+        for i, day in enumerate(data['days']):
+            if not isinstance(day, dict):
+                raise ValueError(f"days[{i}] must be a JSON object")
+            # Cap string field lengths
+            for field in ('topic', 'overview', 'procedures', 'content_standards'):
+                if field in day and isinstance(day[field], str):
+                    day[field] = day[field][:MAX_STRING_LEN]
+
+    return data
+
+
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python generate-lesson-plan.py '<json_data>'", file=sys.stderr)
+    # Prefer stdin; fall back to argv for backwards compatibility
+    raw_input = None
+    if not sys.stdin.isatty():
+        raw_input = sys.stdin.read().strip()
+    if not raw_input and len(sys.argv) >= 2:
+        raw_input = sys.argv[1]
+    if not raw_input:
+        print("Usage: echo '<json_data>' | python generate-lesson-plan.py", file=sys.stderr)
+        print("       python generate-lesson-plan.py '<json_data>'  (legacy)", file=sys.stderr)
         sys.exit(1)
 
     try:
-        data = json.loads(sys.argv[1])
+        data = json.loads(raw_input)
+        data = validate_input(data)
 
         # Check if this is a weekly generation or single lesson
         if 'days' in data:
@@ -2427,15 +1554,13 @@ if __name__ == '__main__':
             print(f"CTE Plans: {len(results['cte_plans'])}")
             for path in results['cte_plans']:
                 print(f"  - {os.path.basename(path)}")
-            print(f"Teacher Handout: {os.path.basename(results['teacher_handout'])}")
-            for path in results['student_handouts']:
-                print(f"Student Handout: {os.path.basename(path)}")
             if results['daily_presentations']:
                 print(f"Daily Presentations: {len(results['daily_presentations'])}")
                 for path in results['daily_presentations']:
                     print(f"  - {os.path.basename(path)}")
             if results.get('media_log'):
                 print(f"Media Log: {os.path.basename(results['media_log'])}")
+            print("NOTE: Generate Teacher/Student handouts separately using the docx skill")
         else:
             # Single CTE lesson plan (backwards compatibility)
             week = data.get('week', '1')
@@ -2444,6 +1569,9 @@ if __name__ == '__main__':
 
     except json.JSONDecodeError as e:
         print(f"ERROR: Invalid JSON - {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"ERROR: Invalid input - {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         import traceback

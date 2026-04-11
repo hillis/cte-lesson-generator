@@ -42,6 +42,12 @@ output/
 *.docx
 *.pptx
 !templates/*.docx
+!assets/*.docx
+
+# Google Drive credentials (sensitive)
+scripts/client_secret.json
+scripts/gdrive-config.json
+scripts/gdrive-token.json
 
 # Environment variables
 .env

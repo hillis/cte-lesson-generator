@@ -16,6 +16,7 @@
 
 ### CTE Lesson Plans
 - **NO RED TEXT** - All text must be black (red placeholders are automatically converted)
+- **Default to 5 days per week** (Monday, Tuesday, Wednesday, Thursday, Friday)
 - Files organized into week folders (Week01, Week02, etc.)
 
 ### Teacher Handouts
